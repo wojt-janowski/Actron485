@@ -4,6 +4,7 @@
 #include "actron485_climate.h"
 #include "esphome/components/climate/climate_traits.h"
 #include "Arduino.h"
+#include <string>
 
 namespace esphome {
 namespace actron485 {
@@ -32,7 +33,7 @@ class Converter {
         static Actron485::FanMode to_actron_fan_mode(ClimateFanMode mode);
 
         static const char *to_preset(bool continuous_mode);
-        static bool to_continuous_mode(const char *preset);
+        static bool to_continuous_mode(const std::string &preset);
 
 };
 

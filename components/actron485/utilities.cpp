@@ -101,7 +101,7 @@ const char* Converter::to_preset(bool continuous_mode) {
     }
 }
 
-bool Converter::to_continuous_mode(const char *preset) {
+bool Converter::to_continuous_mode(const std::string &preset) {
     return preset == Converter::FAN_CONTINUOUS;
 }
 
