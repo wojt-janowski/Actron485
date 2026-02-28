@@ -12,7 +12,11 @@ void Actron485ZoneClimate::update_status() {
         return;
     }
 
-    if ((max(command_last_sent_, actron_controller_->dataLastSentTime) + DEBOUNCE_MILLIS) >= millis()) {
+    unsigned long debounce_since = command_last_sent_;
+    if (actron_controller_->dataLastSentTime > debounce_since) {
+        debounce_since = actron_controller_->dataLastSentTime;
+    }
+    if ((debounce_since + DEBOUNCE_MILLIS) >= millis()) {
         // debounce our commands
         return;
     }

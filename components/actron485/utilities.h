@@ -3,7 +3,6 @@
 #include "Actron485.h"
 #include "actron485_climate.h"
 #include "esphome/components/climate/climate_traits.h"
-#include "Arduino.h"
 #include <string>
 
 namespace esphome {

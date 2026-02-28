@@ -1,5 +1,6 @@
 #include "Actron485Models.h"
 #include "Utilities.h"
+#include <math.h>
 
 namespace Actron485 {
 

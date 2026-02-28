@@ -8,7 +8,11 @@ namespace actron485 {
 Actron485ZoneFan::Actron485ZoneFan() = default;
 
 void Actron485ZoneFan::update_status() {
-    if ((max(command_last_sent_, actron_controller_->dataLastSentTime) + DEBOUNCE_MILLIS) >= millis()) {
+    unsigned long debounce_since = command_last_sent_;
+    if (actron_controller_->dataLastSentTime > debounce_since) {
+        debounce_since = actron_controller_->dataLastSentTime;
+    }
+    if ((debounce_since + DEBOUNCE_MILLIS) >= millis()) {
         // debounce our commands
         return;
     }

@@ -1,7 +1,7 @@
 // Actron RS485 messages
 
 #pragma once
-#include <Arduino.h>
+#include <cstdint>
 
 namespace Actron485 {
 

@@ -1,8 +1,9 @@
-#include <Arduino.h>
+#include <cstdint>
+#include "Actron485Stream.h"
 
 namespace Actron485 {
 
-extern Stream *printOut;
+extern LogSink *printOut;
 
 void printByte(uint8_t byte);
 void printBinaryByte(uint8_t byte);
@@ -16,5 +17,8 @@ bool bytesEqual(uint8_t lhs[], uint8_t rhs[], uint8_t length);
 /// @param length length of array
 /// @return 
 bool copyBytes(uint8_t source[], uint8_t destination[], uint8_t length);
+
+/// @brief Clamp a floating point value between min and max.
+double clampDouble(double value, double minValue, double maxValue);
 
 }

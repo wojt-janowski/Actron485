@@ -9,19 +9,19 @@ namespace Actron485 {
 
 namespace {
 
-void printHex8(Stream *out, uint8_t value) {
+void printHex8(LogSink *out, uint8_t value) {
     char text[5];
     snprintf(text, sizeof(text), "0x%02X", value);
     out->print(text);
 }
 
-void printHex16(Stream *out, uint16_t value) {
+void printHex16(LogSink *out, uint16_t value) {
     char text[7];
     snprintf(text, sizeof(text), "0x%04X", value);
     out->print(text);
 }
 
-void printFloatValue(Stream *out, float value) {
+void printFloatValue(LogSink *out, float value) {
     if (!isfinite(value) || value > 1000000.0f || value < -1000000.0f) {
         out->print("ovf");
         return;
@@ -188,10 +188,10 @@ void Controller::printModbusMessage() {
         if (_serialBufferIndex >= 5) {
             printOut->print("Modbus Exception: Slave ");
             printOut->print(slave);
-            printOut->print(", Function 0x");
-            printOut->print(functionCode & 0x7F, HEX);
-            printOut->print(", Code 0x");
-            printOut->print(_serialBuffer[2], HEX);
+            printOut->print(", Function ");
+            printHex8(printOut, functionCode & 0x7F);
+            printOut->print(", Code ");
+            printHex8(printOut, _serialBuffer[2]);
             printOut->println();
         }
         return;
@@ -205,12 +205,12 @@ void Controller::printModbusMessage() {
             _modbusLastReadFunction = functionCode;
             _modbusLastReadStartAddress = startAddress;
             _modbusLastReadCount = registerCount;
-            _modbusLastReadTimestamp = millis();
+            _modbusLastReadTimestamp = platformMillis();
 
             printOut->print("Modbus Read Request: Slave ");
             printOut->print(slave);
-            printOut->print(", Function 0x");
-            printOut->print(functionCode, HEX);
+            printOut->print(", Function ");
+            printHex8(printOut, functionCode);
             printOut->print(", Start ");
             printOut->print(startAddress);
             printOut->print(", Count ");
@@ -224,7 +224,7 @@ void Controller::printModbusMessage() {
         bool hasAddress = false;
         uint16_t startAddress = 0;
 
-        if ((millis() - _modbusLastReadTimestamp) < 5000 &&
+        if ((platformMillis() - _modbusLastReadTimestamp) < 5000 &&
             _modbusLastReadSlave == slave &&
             _modbusLastReadFunction == functionCode) {
             hasAddress = true;
@@ -233,8 +233,8 @@ void Controller::printModbusMessage() {
 
         printOut->print("Modbus Read Response: Slave ");
         printOut->print(slave);
-        printOut->print(", Function 0x");
-        printOut->print(functionCode, HEX);
+        printOut->print(", Function ");
+        printHex8(printOut, functionCode);
         printOut->print(", Bytes ");
         printOut->print(byteCount);
         printOut->print(", Registers ");
@@ -450,8 +450,8 @@ void Controller::printModbusMessage() {
         return;
     }
 
-    printOut->print("Modbus Function 0x");
-    printOut->print(functionCode, HEX);
+    printOut->print("Modbus Function ");
+    printHex8(printOut, functionCode);
     printOut->print(" from Slave ");
     printOut->print(slave);
     printOut->println();

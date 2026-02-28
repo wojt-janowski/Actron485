@@ -1,5 +1,8 @@
 #pragma once
-#include <Arduino.h>
+#include <cstddef>
+#include <cstdint>
+#include "Actron485Platform.h"
+#include "Actron485Stream.h"
 #include "Actron485Models.h"
 
 /// moves zones 1-8 to array indexed 0-7
@@ -9,7 +12,7 @@ namespace Actron485 {
 
 class Controller {
 
-    Stream *_serial;
+    SerialStream *_serial;
 
     uint8_t _writeEnablePin;
     uint8_t _rxPin;
@@ -114,7 +117,7 @@ public:
     /// @brief initialise controller with a custom stream, e.g. if using single wire
     /// @param stream 
     /// @param writeEnablePin for write enable, set to 0 if not used
-    Controller(Stream &stream, uint8_t writeEnablePin);
+    Controller(SerialStream &stream, uint8_t writeEnablePin);
 
     /// @brief initialise unconfigured controller
     Controller();
@@ -122,11 +125,11 @@ public:
     /// @brief configure after initialisation
     /// @param stream 
     /// @param writeEnablePin for write enable, set to 0 if not used
-    void configure(Stream &stream, uint8_t writeEnablePin);
+    void configure(SerialStream &stream, uint8_t writeEnablePin);
 
     /// @brief pass a different stream to send log messages to
     /// @param stream
-    void configureLogging(Stream *stream);
+    void configureLogging(LogSink *stream);
 
     /// @brief Zone 1 - 8 (indexed 0-7), set bool to corresponding number to make the zone controlled by this controller
     bool zoneControlled[8];

@@ -23,7 +23,7 @@ using climate::ClimateFanMode;
 using climate::ClimateAction;
 
 /* Stream from UART component (copied from Midea component) */
-class UARTStream : public Stream {
+class UARTStream : public Actron485::SerialStream {
     public:
         void set_uart(uart::UARTComponent *uart) { this->uart_ = uart; }
 
@@ -54,18 +54,11 @@ class UARTStream : public Stream {
         uart::UARTComponent *uart_;
 };
 
-class LogStream : public Stream {
+class LogStream : public Actron485::LogSink {
     public:
-        int available() override { return false; }
-        int read() override {
-            return 0;
-        }
-        int peek() override {
-            return 0;
-        }
         size_t write(uint8_t data) override;
         size_t write(const uint8_t *data, size_t size) override;
-        void flush() override;
+        void flush();
     protected:
         static const int bufferSize = 512;
         char _buffer[bufferSize];

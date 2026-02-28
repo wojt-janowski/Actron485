@@ -5,32 +5,30 @@ namespace Actron485 {
  
     void Controller::serialWrite(bool enable) {
         if (enable) {
-            if (_rxPin == _txPin) {
-                pinMatrixOutDetach(_rxPin, false, false);
-                pinMode(_txPin, OUTPUT);
-                pinMatrixOutAttach(_txPin, U1TXD_OUT_IDX, false, false);
-            }
+            platformSwitchSharedUartToTx(_rxPin, _txPin);
 
             if (_writeEnablePin > 0) {
-                digitalWrite(_writeEnablePin, HIGH); 
+                platformDigitalWrite(_writeEnablePin, true);
             }
 
         } else {
-            _serial->flush();
+            if (_serial != nullptr) {
+                _serial->flush();
+            }
 
             if (_writeEnablePin > 0) {
-                digitalWrite(_writeEnablePin, LOW); 
+                platformDigitalWrite(_writeEnablePin, false);
             }
 
-            if (_rxPin == _txPin) {
-                pinMatrixOutDetach(_txPin, false, false);
-                pinMode(_rxPin, INPUT);
-                pinMatrixOutAttach(_rxPin, U1RXD_IN_IDX, false, false);
-            }
+            platformSwitchSharedUartToRx(_rxPin, _txPin);
         }
     }
 
     void Controller::sendZoneMessage(int zone) {
+        if (_serial == nullptr) {
+            return;
+        }
+
         if (printOut) {
             printOut->println("Send Zone Message");
         }
@@ -49,7 +47,11 @@ namespace Actron485 {
 
         // Enforce, and set based on set point range limit, if we aren't currently adjusting the master set point
         if (!sendSetpointCommand) {
-            zoneSetpoint[zindex(zone)] = max(min(zoneSetpoint[zindex(zone)], masterToZoneMessage[zindex(zone)].maxSetpoint), masterToZoneMessage[zindex(zone)].minSetpoint);
+            zoneSetpoint[zindex(zone)] = clampDouble(
+                zoneSetpoint[zindex(zone)],
+                masterToZoneMessage[zindex(zone)].minSetpoint,
+                masterToZoneMessage[zindex(zone)].maxSetpoint
+            );
         }
         zoneMessage[zindex(zone)].setpoint = zoneSetpoint[zindex(zone)];
         
@@ -72,11 +74,17 @@ namespace Actron485 {
     }
 
     void Controller::sendZoneConfigMessage(int zone) {
+        if (_serial == nullptr) {
+            return;
+        }
+
         if (zone <= 0 || zone > 8) {
             // Out of bounds
             return;
         }
-        Serial.println("Send Zone Config");
+        if (printOut) {
+            printOut->println("Send Zone Config");
+        }
         ZoneToMasterMessage configMessage;
         configMessage.type = ZoneMessageType::Config;
         configMessage.zone = zoneMessage[zindex(zone)].zone;
@@ -95,6 +103,10 @@ namespace Actron485 {
     }
 
     void Controller::sendZoneInitMessage(int zone) {
+        if (_serial == nullptr) {
+            return;
+        }
+
         if (printOut) {
             printOut->println("Send Zone Init");
         }
@@ -177,19 +189,17 @@ namespace Actron485 {
         _rxPin = rxPin;
         _txPin = txPin;
         _writeEnablePin = writeEnablePin;
-
-         Serial1.begin(4800, SERIAL_8N1, rxPin, txPin);
-        _serial = &Serial1;
+        _serial = platformInitDefaultSerial(rxPin, txPin);
 
         if (writeEnablePin > 0) {
-            pinMode(writeEnablePin, OUTPUT);
+            platformPinModeOutput(writeEnablePin);
             serialWrite(false);
         }
         
         setup();
     }
 
-    Controller::Controller(Stream &stream, uint8_t writeEnablePin) {
+    Controller::Controller(SerialStream &stream, uint8_t writeEnablePin) {
         _serial = &stream;
         _writeEnablePin = writeEnablePin;
         setup();
@@ -199,12 +209,12 @@ namespace Actron485 {
         setup();
     }
 
-    void Controller::configure(Stream &stream, uint8_t writeEnablePin) {
+    void Controller::configure(SerialStream &stream, uint8_t writeEnablePin) {
         _serial = &stream;
         _writeEnablePin = writeEnablePin;
     }
 
-    void Controller::configureLogging(Stream *stream) {
+    void Controller::configureLogging(LogSink *stream) {
         printOut = stream;
     }
 
@@ -242,6 +252,10 @@ namespace Actron485 {
     }
 
     bool Controller::sendQueuedCommand() {
+        if (_serial == nullptr) {
+            return false;
+        }
+
         uint8_t data[7];
         int send = 0;
 
@@ -317,7 +331,7 @@ namespace Actron485 {
             }
 
             serialWrite(false);
-            dataLastSentTime = millis();
+            dataLastSentTime = platformMillis();
         }
         
         return send > 0;
@@ -499,7 +513,11 @@ namespace Actron485 {
     }
 
     void Controller::loop() {
-        unsigned long now = millis();
+        if (_serial == nullptr) {
+            return;
+        }
+
+        unsigned long now = platformMillis();
         long serialLastReceivedTime = now - _serialBufferReceivedTime;
 
         if (_serialBufferIndex > 0) {
@@ -530,7 +548,7 @@ namespace Actron485 {
             _serialBuffer[_serialBufferIndex] = byte;
             _serialBufferIndex++;
             bytesRead++;
-            _serialBufferReceivedTime = millis();
+            _serialBufferReceivedTime = platformMillis();
 
             if (_serialBufferIndex == 1) {
                 MessageType messageType = detectActronMessageType(_serialBuffer[0]);
@@ -554,7 +572,7 @@ namespace Actron485 {
     }
 
     void Controller::attemptToSendQueuedCommand() {
-        unsigned long now = millis();
+        unsigned long now = platformMillis();
         // Rate limit us sending 1 message every 2 seconds
         if ((now - dataLastSentTime) > 1999) {
             // Reset board comms1 counter
@@ -567,7 +585,7 @@ namespace Actron485 {
     }
 
     void Controller::processMessage(uint8_t *data, uint8_t length) {
-        unsigned long now = millis();
+        unsigned long now = platformMillis();
         dataLastReceivedTime = now;
         bool printChangesOnly = printOutMode == PrintOutMode::ChangedMessages;
         bool printAll = (printOutMode == PrintOutMode::AllMessages);
@@ -773,7 +791,7 @@ namespace Actron485 {
     /// Convenient functions, that are the typical use for this module
 
     bool Controller::receivingData() {
-        return (millis() - dataLastReceivedTime) < 3000;
+        return (platformMillis() - dataLastReceivedTime) < 3000;
     }
 
     // Setup

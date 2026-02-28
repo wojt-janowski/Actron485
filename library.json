@@ -20,6 +20,9 @@
     "homepage": "https://github.com/awulf/actron485",
     "dependencies": {
     },
-    "frameworks": "Arduino",
+    "frameworks": [
+      "arduino",
+      "espidf"
+    ],
     "platforms": "*"
   }

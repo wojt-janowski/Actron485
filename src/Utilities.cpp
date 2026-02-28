@@ -1,18 +1,18 @@
 #include "Utilities.h"
+#include <cstdio>
 
 namespace Actron485 {
 
-Stream *printOut = NULL;
+LogSink *printOut = NULL;
 
 void printByte(uint8_t byte) {
     if (printOut == NULL) {
         return;
     }
 
-    if (byte <= 0x0f) {
-        printOut->print("0");  
-    }
-    printOut->print(byte, HEX);
+    char text[4];
+    snprintf(text, sizeof(text), "%02X", byte);
+    printOut->print(text);
     printOut->print(" ");
 }
 
@@ -64,6 +64,16 @@ bool copyBytes(uint8_t source[], uint8_t destination[], uint8_t length) {
         destination[i] = source[i];
     }
     return !same;
+}
+
+double clampDouble(double value, double minValue, double maxValue) {
+    if (value < minValue) {
+        return minValue;
+    }
+    if (value > maxValue) {
+        return maxValue;
+    }
+    return value;
 }
 
 }
