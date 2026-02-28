@@ -469,6 +469,239 @@ namespace Actron485 {
         return _serialBuffer[_serialBufferIndex - 2] == expectedChecksumLow && _serialBuffer[_serialBufferIndex - 1] == expectedChecksumHigh;
     }
 
+    void Controller::printModbusMessage() {
+        if (!printOut || _serialBufferIndex < 4) {
+            return;
+        }
+
+        auto printHex16 = [&](uint16_t value) {
+            char text[7];
+            snprintf(text, sizeof(text), "0x%04X", value);
+            printOut->print(text);
+        };
+
+        auto printRegisterValue = [&](uint16_t regAddress, int regIndex, uint16_t regValue, bool hasAddress) {
+            if (hasAddress) {
+                printOut->print("Modbus Reg ");
+                printHex16(regAddress);
+                printOut->print(": ");
+            } else {
+                printOut->print("Modbus Reg R");
+                printOut->print(regIndex);
+                printOut->print(": ");
+            }
+            printOut->print("u16=");
+            printOut->print(regValue);
+            printOut->print(" (");
+            printHex16(regValue);
+            printOut->print("), i16=");
+            printOut->print((int16_t) regValue);
+            printOut->println();
+        };
+
+        auto printFloatPair = [&](uint16_t addressLow, int pairIndex, uint16_t regA, uint16_t regB, bool hasAddress) {
+            uint32_t rawABCD = ((uint32_t) regA << 16) | regB;
+            uint32_t rawCDAB = ((uint32_t) regB << 16) | regA;
+            float floatABCD = 0.0f;
+            float floatCDAB = 0.0f;
+            memcpy(&floatABCD, &rawABCD, sizeof(float));
+            memcpy(&floatCDAB, &rawCDAB, sizeof(float));
+
+            if (hasAddress) {
+                printOut->print("Modbus F32 ");
+                printHex16(addressLow);
+                printOut->print("/");
+                printHex16(addressLow + 1);
+                printOut->print(": ");
+            } else {
+                printOut->print("Modbus F32 P");
+                printOut->print(pairIndex);
+                printOut->print(": ");
+            }
+
+            printOut->print("abcd=");
+            if (isfinite(floatABCD)) {
+                printOut->print(floatABCD, 4);
+            } else {
+                printOut->print("nan/inf");
+            }
+            printOut->print(", cdab=");
+            if (isfinite(floatCDAB)) {
+                printOut->print(floatCDAB, 4);
+            } else {
+                printOut->print("nan/inf");
+            }
+            printOut->println();
+        };
+
+        uint8_t slave = _serialBuffer[0];
+        uint8_t functionCode = _serialBuffer[1];
+        bool isException = (functionCode & 0x80) == 0x80;
+
+        printOut->print("Modbus Message Ignored: ");
+        printBytes(_serialBuffer, _serialBufferIndex);
+        printOut->println();
+
+        if (isException) {
+            if (_serialBufferIndex >= 5) {
+                printOut->print("Modbus Exception: Slave ");
+                printOut->print(slave);
+                printOut->print(", Function 0x");
+                printOut->print(functionCode & 0x7F, HEX);
+                printOut->print(", Code 0x");
+                printOut->print(_serialBuffer[2], HEX);
+                printOut->println();
+            }
+            return;
+        }
+
+        if (functionCode == 0x03 || functionCode == 0x04) {
+            if (_serialBufferIndex == 8) {
+                uint16_t startAddress = ((uint16_t) _serialBuffer[2] << 8) | _serialBuffer[3];
+                uint16_t registerCount = ((uint16_t) _serialBuffer[4] << 8) | _serialBuffer[5];
+                _modbusLastReadSlave = slave;
+                _modbusLastReadFunction = functionCode;
+                _modbusLastReadStartAddress = startAddress;
+                _modbusLastReadCount = registerCount;
+                _modbusLastReadTimestamp = millis();
+                printOut->print("Modbus Read Request: Slave ");
+                printOut->print(slave);
+                printOut->print(", Function 0x");
+                printOut->print(functionCode, HEX);
+                printOut->print(", Start ");
+                printOut->print(startAddress);
+                printOut->print(", Count ");
+                printOut->print(registerCount);
+                printOut->println();
+                return;
+            }
+
+            uint8_t byteCount = _serialBuffer[2];
+            uint16_t registerCount = byteCount / 2;
+            bool hasAddress = false;
+            uint16_t startAddress = 0;
+
+            // Correlate read response with most recent read request
+            if ((millis() - _modbusLastReadTimestamp) < 5000 &&
+                _modbusLastReadSlave == slave &&
+                _modbusLastReadFunction == functionCode) {
+                hasAddress = true;
+                startAddress = _modbusLastReadStartAddress;
+            }
+
+            printOut->print("Modbus Read Response: Slave ");
+            printOut->print(slave);
+            printOut->print(", Function 0x");
+            printOut->print(functionCode, HEX);
+            printOut->print(", Bytes ");
+            printOut->print(byteCount);
+            printOut->print(", Registers ");
+            printOut->print(registerCount);
+            if (hasAddress) {
+                printOut->print(", Start ");
+                printHex16(startAddress);
+                if (_modbusLastReadCount != registerCount) {
+                    printOut->print(" (last request count=");
+                    printOut->print(_modbusLastReadCount);
+                    printOut->print(")");
+                }
+            }
+            printOut->println();
+
+            if ((byteCount % 2) == 0) {
+                for (uint8_t offset = 0; offset < byteCount; offset += 2) {
+                    uint16_t regValue = ((uint16_t) _serialBuffer[3 + offset] << 8) | _serialBuffer[4 + offset];
+                    uint16_t regAddress = startAddress + (offset / 2);
+                    printRegisterValue(regAddress, offset / 2, regValue, hasAddress);
+                }
+                for (uint8_t offset = 0; offset + 3 < byteCount; offset += 4) {
+                    uint16_t regA = ((uint16_t) _serialBuffer[3 + offset] << 8) | _serialBuffer[4 + offset];
+                    uint16_t regB = ((uint16_t) _serialBuffer[5 + offset] << 8) | _serialBuffer[6 + offset];
+                    uint16_t regAddress = startAddress + (offset / 2);
+                    printFloatPair(regAddress, offset / 4, regA, regB, hasAddress);
+                }
+            }
+            return;
+        }
+
+        if (functionCode == 0x06) {
+            if (_serialBufferIndex == 8) {
+                uint16_t registerAddress = ((uint16_t) _serialBuffer[2] << 8) | _serialBuffer[3];
+                uint16_t registerValue = ((uint16_t) _serialBuffer[4] << 8) | _serialBuffer[5];
+                printOut->print("Modbus Write Single Register: Slave ");
+                printOut->print(slave);
+                printOut->print(", Address ");
+                printOut->print(registerAddress);
+                printOut->print(", Value ");
+                printOut->print(registerValue);
+                printOut->print(" (0x");
+                printOut->print(registerValue, HEX);
+                printOut->print(")");
+                printOut->println();
+            }
+            return;
+        }
+
+        if (functionCode == 0x10) {
+            if (_serialBufferIndex == 8) {
+                uint16_t startAddress = ((uint16_t) _serialBuffer[2] << 8) | _serialBuffer[3];
+                uint16_t registerCount = ((uint16_t) _serialBuffer[4] << 8) | _serialBuffer[5];
+                printOut->print("Modbus Write Multiple Registers Response: Slave ");
+                printOut->print(slave);
+                printOut->print(", Start ");
+                printOut->print(startAddress);
+                printOut->print(", Count ");
+                printOut->print(registerCount);
+                printOut->println();
+                return;
+            }
+
+            if (_serialBufferIndex >= 9) {
+                uint16_t startAddress = ((uint16_t) _serialBuffer[2] << 8) | _serialBuffer[3];
+                uint16_t registerCount = ((uint16_t) _serialBuffer[4] << 8) | _serialBuffer[5];
+                uint8_t byteCount = _serialBuffer[6];
+                printOut->print("Modbus Write Multiple Registers Request: Slave ");
+                printOut->print(slave);
+                printOut->print(", Start ");
+                printOut->print(startAddress);
+                printOut->print(", Count ");
+                printOut->print(registerCount);
+                printOut->print(", Bytes ");
+                printOut->print(byteCount);
+                printOut->println();
+
+                uint16_t regsFromBytes = byteCount / 2;
+                uint16_t decodedRegs = (regsFromBytes < registerCount) ? regsFromBytes : registerCount;
+
+                for (uint16_t reg = 0; reg < decodedRegs; reg++) {
+                    uint8_t baseOffset = 7 + (reg * 2);
+                    if (baseOffset + 1 >= _serialBufferIndex - 2) {
+                        break;
+                    }
+                    uint16_t regValue = ((uint16_t) _serialBuffer[baseOffset] << 8) | _serialBuffer[baseOffset + 1];
+                    printRegisterValue(startAddress + reg, reg, regValue, true);
+                }
+
+                for (uint16_t reg = 0; reg + 1 < decodedRegs; reg += 2) {
+                    uint8_t baseOffset = 7 + (reg * 2);
+                    if (baseOffset + 3 >= _serialBufferIndex - 2) {
+                        break;
+                    }
+                    uint16_t regA = ((uint16_t) _serialBuffer[baseOffset] << 8) | _serialBuffer[baseOffset + 1];
+                    uint16_t regB = ((uint16_t) _serialBuffer[baseOffset + 2] << 8) | _serialBuffer[baseOffset + 3];
+                    printFloatPair(startAddress + reg, reg / 2, regA, regB, true);
+                }
+            }
+            return;
+        }
+
+        printOut->print("Modbus Function 0x");
+        printOut->print(functionCode, HEX);
+        printOut->print(" from Slave ");
+        printOut->print(slave);
+        printOut->println();
+    }
+
     ///////////////////////////////////
     // Message type
 

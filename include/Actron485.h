@@ -33,6 +33,12 @@ class Controller {
     uint8_t _serialBufferIndex = 0;
     /// @brief Expected message length based on first bytes, 0 means unknown/variable
     uint8_t _serialBufferExpectedLength = 0;
+    /// @brief Last Modbus read request context for decoding responses
+    uint8_t _modbusLastReadSlave = 0;
+    uint8_t _modbusLastReadFunction = 0;
+    uint16_t _modbusLastReadStartAddress = 0;
+    uint16_t _modbusLastReadCount = 0;
+    unsigned long _modbusLastReadTimestamp = 0;
 
     /// Keeps track of if a response occurs after a set zone command is sent, so we know if we can discard our snapshot of the zone state
     bool _sendZoneStateCommandCleared = true;
