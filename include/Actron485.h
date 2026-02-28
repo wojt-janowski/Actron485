@@ -31,6 +31,8 @@ class Controller {
     static const unsigned long _serialBufferBreak = 5;
     /// @brief Index of current sequence being read
     uint8_t _serialBufferIndex = 0;
+    /// @brief Expected message length based on first bytes, 0 means unknown/variable
+    uint8_t _serialBufferExpectedLength = 0;
 
     /// Keeps track of if a response occurs after a set zone command is sent, so we know if we can discard our snapshot of the zone state
     bool _sendZoneStateCommandCleared = true;
@@ -73,6 +75,19 @@ class Controller {
     /// @brief Message Send Check
     /// @returns true if message length is as expected, prints error if printing enabled
     bool messageLengthCheck(int received, int expected, const char *name, uint8_t *data);
+
+    /// @brief Flushes currently collected serial buffer, processing non-modbus messages
+    void flushSerialBuffer();
+    /// @brief Returns expected length for fixed-size Actron messages, 0 if variable/unknown
+    uint8_t expectedActronMessageLength(MessageType messageType);
+    /// @brief Checks if a function code is a supported Modbus RTU function for detection
+    bool isProbableModbusFunction(uint8_t functionCode);
+    /// @brief Returns expected Modbus RTU message length for current buffer, 0 if not likely Modbus
+    uint8_t expectedModbusMessageLength();
+    /// @brief CRC16 (Modbus RTU) for provided data
+    uint16_t checksumModbus(const uint8_t *data, uint8_t length);
+    /// @brief Checks if current buffer is a valid Modbus RTU frame
+    bool isModbusMessage();
 
 public:
 

@@ -7,7 +7,6 @@ namespace Actron485 {
 // Actron485::ZoneToMasterMessage
 
 void ZoneToMasterMessage::print() {
-    Serial.println((int)&printOut);
     if (!printOut) {
         return;
     }
@@ -491,13 +490,13 @@ void ZoneSetpointCustomCommand::print() {
     printOut->println();
 }
 
-void ZoneSetpointCustomCommand::parse(uint8_t data[3]) {
+void ZoneSetpointCustomCommand::parse(uint8_t data[4]) {
     zone = data[1];
     temperature = ((double) data[2]) / 2.0;
     adjustMaster = (bool) data[3];
 }
 
-void ZoneSetpointCustomCommand::generate(uint8_t data[3]) {
+void ZoneSetpointCustomCommand::generate(uint8_t data[4]) {
     data[0] = (uint8_t) MessageType::CustomCommandChangeZoneSetpoint;
     data[1] = zone;
     data[2] = (uint8_t) round(temperature * 2);

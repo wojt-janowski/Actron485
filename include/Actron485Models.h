@@ -279,7 +279,7 @@ struct OperatingModeCommand {
 /// @brief Custom command to this library, allows other controllers (e.g. a seperate zone wall controllers)
 /// to change the temperature via direct communication
 struct ZoneSetpointCustomCommand {
-    static const uint8_t messageLength = 3;
+    static const uint8_t messageLength = 4;
 
     // In °C 16-30° in 0.5° increments
     double temperature;
@@ -294,12 +294,12 @@ struct ZoneSetpointCustomCommand {
     void print();
 
     /// @brief parse data provided
-    /// @param data to read of 2 bytes
-    void parse(uint8_t data[2]);
+    /// @param data to read of 4 bytes
+    void parse(uint8_t data[messageLength]);
     
     /// @brief generates the data from the variables in this struct
-    /// @param data to write to, 2 bytes long
-    void generate(uint8_t data[2]);
+    /// @param data to write to, 4 bytes long
+    void generate(uint8_t data[messageLength]);
 };
 
 struct StateMessage {

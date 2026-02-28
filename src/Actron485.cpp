@@ -59,7 +59,7 @@ namespace Actron485 {
         serialWrite(true); 
         
         for (int i=0; i<5; i++) {
-            Serial1.write(data[i]);
+            _serial->write(data[i]);
         }
 
         serialWrite(false);
@@ -341,6 +341,134 @@ namespace Actron485 {
         return false;
     }
 
+    void Controller::flushSerialBuffer() {
+        if (_serialBufferIndex == 0) {
+            return;
+        }
+
+        if (!isModbusMessage()) {
+            processMessage(_serialBuffer, _serialBufferIndex);
+        } else if (printOut && printOutMode == PrintOutMode::AllMessages) {
+            printOut->print("Modbus Message Ignored: ");
+            printBytes(_serialBuffer, _serialBufferIndex);
+            printOut->println();
+        }
+
+        _serialBufferIndex = 0;
+        _serialBufferExpectedLength = 0;
+    }
+
+    uint8_t Controller::expectedActronMessageLength(MessageType messageType) {
+        switch (messageType) {
+            case MessageType::CommandMasterSetpoint:
+            case MessageType::CommandFanMode:
+            case MessageType::CommandOperatingMode:
+            case MessageType::CommandZoneState:
+                return 2;
+            case MessageType::CustomCommandChangeZoneSetpoint:
+                return ZoneSetpointCustomCommand::messageLength;
+            case MessageType::ZoneWallController:
+                return ZoneToMasterMessage::messageLength;
+            case MessageType::ZoneMasterController:
+                return MasterToZoneMessage::messageLength;
+            case MessageType::IndoorBoard2:
+                return StateMessage2::stateMessageLength;
+            case MessageType::Stat1:
+                return StateMessage::stateMessageLength;
+            case MessageType::Stat2:
+                return stat2MessageLength;
+            case MessageType::UltimaState:
+                return UltimaState::stateMessageLength;
+            case MessageType::IndoorBoard1:
+            case MessageType::Unknown:
+                return 0;
+        }
+        return 0;
+    }
+
+    bool Controller::isProbableModbusFunction(uint8_t functionCode) {
+        return functionCode == 0x03 || functionCode == 0x04 || functionCode == 0x06 || functionCode == 0x10;
+    }
+
+    uint8_t Controller::expectedModbusMessageLength() {
+        if (_serialBufferIndex < 2) {
+            return 0;
+        }
+
+        // Typical Modbus RTU address range 1..247
+        if (_serialBuffer[0] == 0x00 || _serialBuffer[0] > 0xF7) {
+            return 0;
+        }
+
+        uint8_t functionCode = _serialBuffer[1];
+        if (!isProbableModbusFunction(functionCode)) {
+            return 0;
+        }
+
+        if (functionCode == 0x06) {
+            return 8;
+        }
+
+        if (functionCode == 0x03 || functionCode == 0x04) {
+            // Could be request (8 bytes) or response (5 + byte_count)
+            uint8_t expected = 8;
+            if (_serialBufferIndex >= 3) {
+                uint16_t responseLength = (uint16_t) (5 + _serialBuffer[2]);
+                if (responseLength >= 8 && responseLength <= _serialBufferSize) {
+                    expected = responseLength;
+                }
+            }
+            return expected;
+        }
+
+        if (functionCode == 0x10) {
+            // Could be response (8 bytes) or request (9 + byte_count)
+            uint8_t expected = 8;
+            if (_serialBufferIndex >= 7) {
+                uint16_t requestLength = (uint16_t) (9 + _serialBuffer[6]);
+                if (requestLength >= 8 && requestLength <= _serialBufferSize) {
+                    expected = requestLength;
+                }
+            }
+            return expected;
+        }
+
+        return 0;
+    }
+
+    uint16_t Controller::checksumModbus(const uint8_t *data, uint8_t length) {
+        uint16_t checksum = 0xFFFF;
+
+        for (uint8_t i = 0; i < length; i++) {
+            checksum ^= data[i];
+            for (uint8_t bit = 0; bit < 8; bit++) {
+                if (checksum & 0x0001) {
+                    checksum = (checksum >> 1) ^ 0xA001;
+                } else {
+                    checksum = checksum >> 1;
+                }
+            }
+        }
+        return checksum;
+    }
+
+    bool Controller::isModbusMessage() {
+        if (_serialBufferIndex < 4) {
+            return false;
+        }
+
+        uint8_t expectedLength = expectedModbusMessageLength();
+        if (expectedLength == 0 || _serialBufferIndex != expectedLength) {
+            return false;
+        }
+
+        uint16_t expectedChecksum = checksumModbus(_serialBuffer, _serialBufferIndex - 2);
+        uint8_t expectedChecksumLow = expectedChecksum & 0xFF;
+        uint8_t expectedChecksumHigh = (expectedChecksum >> 8) & 0xFF;
+
+        return _serialBuffer[_serialBufferIndex - 2] == expectedChecksumLow && _serialBuffer[_serialBufferIndex - 1] == expectedChecksumHigh;
+    }
+
     ///////////////////////////////////
     // Message type
 
@@ -374,11 +502,20 @@ namespace Actron485 {
 
     void Controller::loop() {
         unsigned long now = millis();
-        long serialLastReceivedTime = now-_serialBufferReceivedTime;
+        long serialLastReceivedTime = now - _serialBufferReceivedTime;
 
-        if (_serialBufferIndex > 0 && serialLastReceivedTime > _serialBufferBreak) {
-            processMessage(_serialBuffer, _serialBufferIndex);
-            _serialBufferIndex = 0;
+        if (_serialBufferIndex > 0) {
+            unsigned long serialFrameTimeout = _serialBufferBreak * 4;
+            if (serialFrameTimeout < 30) {
+                serialFrameTimeout = 30;
+            }
+
+            bool messageBreak = serialLastReceivedTime > _serialBufferBreak;
+            bool messageTimeout = serialLastReceivedTime > serialFrameTimeout;
+
+            if ((_serialBufferExpectedLength == 0 && messageBreak) || (_serialBufferExpectedLength > 0 && messageTimeout)) {
+                flushSerialBuffer();
+            }
         }
 
         // A gap send our message?
@@ -387,11 +524,34 @@ namespace Actron485 {
             attemptToSendQueuedCommand();
         }
 
-        while(_serial->available() > 0 && _serialBufferIndex < _serialBufferSize) {
+        const uint8_t maxBytesPerLoop = 64;
+        uint8_t bytesRead = 0;
+
+        while(_serial->available() > 0 && _serialBufferIndex < _serialBufferSize && bytesRead < maxBytesPerLoop) {
             uint8_t byte = _serial->read();
             _serialBuffer[_serialBufferIndex] = byte;
             _serialBufferIndex++;
+            bytesRead++;
             _serialBufferReceivedTime = millis();
+
+            if (_serialBufferIndex == 1) {
+                MessageType messageType = detectActronMessageType(_serialBuffer[0]);
+                _serialBufferExpectedLength = expectedActronMessageLength(messageType);
+            }
+
+            uint8_t modbusLength = expectedModbusMessageLength();
+            if (modbusLength > 0 && (_serialBufferExpectedLength == 0 || modbusLength > _serialBufferExpectedLength)) {
+                // Allow variable-length Modbus responses (0x03/0x04/0x10) to grow once byte_count arrives.
+                _serialBufferExpectedLength = modbusLength;
+            }
+
+            if (_serialBufferExpectedLength > 0 && _serialBufferIndex >= _serialBufferExpectedLength) {
+                flushSerialBuffer();
+            }
+        }
+
+        if (_serialBufferIndex >= _serialBufferSize) {
+            flushSerialBuffer();
         }
     }
 
@@ -449,53 +609,70 @@ namespace Actron485 {
                     break;
                 case MessageType::CustomCommandChangeZoneSetpoint:
                     {
+                        expectedMessageLength = ZoneSetpointCustomCommand::messageLength;
+                        if (!messageLengthCheck(length, expectedMessageLength, "Zone Setpoint Command", data)) {
+                            break;
+                        }
                         ZoneSetpointCustomCommand command;
                         command.parse(data);
-                        if (zoneControlled[zindex(command.zone)]) {
+                        if (command.zone >= 1 && command.zone <= 8 && zoneControlled[zindex(command.zone)]) {
                             setZoneSetpointTemperature(command.zone, command.temperature, command.adjustMaster);
                         }
                     }
                     break;
                 case MessageType::ZoneWallController:
+                    zone = data[0] & 0x0F;
+                    if (!(0 < zone && zone <= 8)) {
+                        break;
+                    }
                     expectedMessageLength = zoneMessage[zindex(zone)].messageLength;
                     if (!messageLengthCheck(length, expectedMessageLength, "Zone Message", data)) {
                         break;
                     }
-                    zone = data[0] & 0x0F;
-                    if (0 < zone && zone <= 8) {
-                        if (zoneMessage[zindex(zone)].parse(data)) {
-                            changed = copyBytes(data, zoneWallMessageRaw[zindex(zone)], expectedMessageLength);
-                            if (printOut && (printAll || (printChangesOnly && changed))) {
-                                zoneMessage[zindex(zone)].print();
-                                printOut->println();
-                            }
-                        } else if (printOut) {
-                            printOut->println("Zone Message: Checksum failed");
+                    if (zoneMessage[zindex(zone)].parse(data)) {
+                        changed = copyBytes(data, zoneWallMessageRaw[zindex(zone)], expectedMessageLength);
+                        if (printOut && (printAll || (printChangesOnly && changed))) {
+                            zoneMessage[zindex(zone)].print();
+                            printOut->println();
                         }
+                    } else if (printOut) {
+                        printOut->println("Zone Message: Checksum failed");
                     }
                     break;
                 case MessageType::ZoneMasterController:
+                    zone = data[0] & 0x0F;
+                    if (!(0 < zone && zone <= 8)) {
+                        break;
+                    }
                     expectedMessageLength = masterToZoneMessage[zindex(zone)].messageLength;
                     if (!messageLengthCheck(length, expectedMessageLength, "Master to Zone", data)) {
                         break;
                     }
-                    zone = data[0] & 0x0F;
-                    if (0 < zone && zone <= 8) {
-                        if (masterToZoneMessage[zindex(zone)].parse(data)) {
-                            changed = copyBytes(data, zoneMasterMessageRaw[zindex(zone)], expectedMessageLength);
+                    if (masterToZoneMessage[zindex(zone)].parse(data)) {
+                        changed = copyBytes(data, zoneMasterMessageRaw[zindex(zone)], expectedMessageLength);
 
-                            if (printOut && (printAll || (printChangesOnly && changed))) {
-                                masterToZoneMessage[zindex(zone)].print();
-                                printOut->println();
-                            }
-                        } else if (printOut) {
-                            printOut->println("Master to Zone: Checksum failed");
+                        if (printOut && (printAll || (printChangesOnly && changed))) {
+                            masterToZoneMessage[zindex(zone)].print();
+                            printOut->println();
                         }
+                    } else if (printOut) {
+                        printOut->println("Master to Zone: Checksum failed");
                     }
                     break;
                 case MessageType::IndoorBoard1:
-                    changed = copyBytes(data, boardComms1Message[boardComms1Index], length);
-                    boardComms1MessageLength[boardComms1Index] = length;
+                    expectedMessageLength = sizeof(boardComms1Message[boardComms1Index]);
+                    if (length > expectedMessageLength && printOut) {
+                        printOut->print("Indoor Board Message: Truncating length ");
+                        printOut->print(length);
+                        printOut->print(" to ");
+                        printOut->print(expectedMessageLength);
+                        printOut->println();
+                    }
+                    {
+                        uint8_t copiedLength = (length > expectedMessageLength ? expectedMessageLength : length);
+                        changed = copyBytes(data, boardComms1Message[boardComms1Index], copiedLength);
+                        boardComms1MessageLength[boardComms1Index] = copiedLength;
+                    }
                     boardComms1Index = (boardComms1Index + 1)%2;
                     break;
                 case MessageType::IndoorBoard2:
