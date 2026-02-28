@@ -1,0 +1,125 @@
+===============
+Actron485 Modbus Notes (Current Findings)
+
+The physical layer is RS-485. On the wire we see both:
+1) Native Actron packets (A0/Cx/8x/E0/etc)
+2) Modbus RTU frames (01 03..., 01 06..., 01 10...)
+
+This file tracks correlation findings between Modbus RTU traffic and parsed
+Actron state.
+
+===============
+Observed Modbus Poll/Control Pattern
+
+Read Requests/Responses (Function 0x03):
+- Start 0x000F, Count 4
+- Start 0x0023, Count 13
+- Start 0x0078, Count 16
+- Start 0x00B4, Count 9
+
+Write Single (Function 0x06):
+- Address 0x0029, Value 0x0000
+- Address 0x002C, Value 0x0000
+
+Write Multiple (Function 0x10):
+- Start 0x0122, Count 6, Bytes 12
+
+===============
+Confirmed Mapping (High Confidence)
+
+Write Multiple block start 0x0122 (6 registers):
+
+- Reg 0 (0x0122): Master setpoint, encoded as C * 2.0
+  Example: 0x0026 -> 19.0C
+
+- Reg 1 (0x0123): Master current temperature, encoded as C * 10.0 signed
+  Example: 0x00F1 -> 24.1C
+
+- Reg 2 (0x0124): Status/flags bitfield (changes with system state)
+
+- Reg 3..5 (0x0125..0x0127): trailing control words, often 0x0000, 0x0000, 0x005C
+  Meaning still unknown.
+
+`CAP MODBUS MAP` now includes direct Actron comparison:
+- Likely Master Setpoint
+- Likely Master Temp
+- Flags
+- ModbusFlagsLow
+- Actron SP
+- Actron Temp
+- dSP (Modbus - Actron)
+- dTemp (Modbus - Actron)
+- ActronZoneBits (from Stat1 raw byte 11)
+- ActronStat1Flags (from Stat1 raw byte 18)
+- FlagsXor (ModbusFlagsLow XOR ActronStat1Flags)
+- Match (yes/no/n/a)
+
+Baseline observed repeatedly in live capture:
+- Modbus SP == Actron SP
+- Modbus Temp == Actron Temp
+- dSP=0.0, dTemp=0.0
+- Setpoint transitions track exactly (for example 19.0C -> 19.5C in Modbus and Actron together)
+
+===============
+Candidate Mapping (Needs More Variation)
+
+These are logged as `CAP MODBUS CAND` and should not be treated as final:
+
+- 0x000F block:
+  - Reg0 behaves like a global status bitfield (often 0x2001)
+  - Current capture logs print:
+    - `bit0` and `bit13` (from `0x2001`)
+  - Bit-level semantics still need state-transition testing
+
+- 0x0122 reg2 (Flags low byte) vs Stat1 byte[18]:
+  - Observed relation: ModbusFlagsLow=0x85 while ActronStat1Flags=0x87
+  - Observed XOR = 0x02 in current captures
+  - This suggests close overlap but not identical bit definitions
+
+- 0x0023 block:
+  - Stable profile values (r0..r4 often 26, r10=100, r11=200, r12=200)
+  - Likely configuration/limits table
+
+- 0x0078 block:
+  - First pairs decode cleanly as float32 (ABCD order)
+  - Current capture logs print candidate float tuple:
+    - `f32=13.x,13.x,20.0,20.0,20.x,22.3`
+  - Appears telemetry-like, field semantics still unknown
+
+- 0x00B4 block:
+  - Signed/limit-looking values (for example -800, 1200, 199, 21, 30)
+  - Current capture logs print:
+    - `signed10=-80.0,22.0,19.9`
+    - trailing `raw=80/20/30`
+  - Likely internal telemetry/threshold data
+
+===============
+Capture Mode and Paste-Friendly Logs
+
+Use ESPHome:
+  logging_mode: CAPTURE
+
+CAPTURE mode emits compact lines:
+- CAP MODBUS RAW: ...
+- CAP MODBUS MAP: ...
+- CAP MODBUS CAND: ...
+- CAP ACTRON STATE: ...
+- CAP ACTRON STATE2: ...
+- CAP ACTRON ULTIMA: ...
+- CAP ACTRON C: ... (zone wall)
+- CAP ACTRON M: ... (master->zone)
+
+Implementation location:
+- Capture/diagnostic logic is now isolated in:
+  - `src/Actron485Capturing.cpp`
+- Core message flow remains in:
+  - `src/Actron485.cpp`
+
+Suggested filter for correlation sessions:
+  esphome logs <yaml> --device <ip> | rg "CAP MODBUS MAP|CAP MODBUS CAND|CAP ACTRON STATE|CAP ACTRON ULTIMA|CAP ACTRON C:|CAP ACTRON M:"
+
+To improve confidence, capture while changing one thing at a time:
+- master setpoint
+- fan mode
+- operating mode
+- individual zone on/off

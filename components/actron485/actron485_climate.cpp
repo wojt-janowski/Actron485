@@ -14,10 +14,11 @@ static Actron485::Controller actron_controller = Actron485::Controller();
 static long counter = 0;
 
 size_t LogStream::write(uint8_t data) {
-    if (_bufferIndex >= bufferSize) {
-        // Need to print contents
+    if (_bufferIndex >= (bufferSize - 1)) {
+        // Buffer full: emit current chunk instead of dropping log data.
+        _buffer[_bufferIndex] = '\0';
+        ESP_LOGD(TAG, "%s", _buffer);
         _bufferIndex = 0;
-        return 0;
     }
 
     if (data == '\r' || data == '\0') {
@@ -42,7 +43,12 @@ size_t LogStream::write(const uint8_t *data, size_t size) {
 }
 
 void LogStream::flush() {
-    ESP_LOGD(TAG, "FLUSH");
+    if (_bufferIndex <= 0) {
+        return;
+    }
+    _buffer[_bufferIndex] = '\0';
+    ESP_LOGD(TAG, "%s", _buffer);
+    _bufferIndex = 0;
 }
 
 void Actron485ZoneFan::setup() {
@@ -67,6 +73,10 @@ void Actron485Climate::setup() {
                 break;
             case 3:
                 actron_controller.printOutMode = Actron485::PrintOutMode::AllMessages;
+                break;
+            case 4:
+                actron_controller.printOutMode = Actron485::PrintOutMode::CorrelationCapture;
+                break;
         }
     }
 

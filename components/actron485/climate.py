@@ -33,6 +33,7 @@ ALLOWED_LOGGING_MODES = {
     "STATUS": 1,
     "CHANGE": 2,
     "ALL": 3,
+    "CAPTURE": 4,
 }
 
 ultima_config_parameter = {
@@ -162,4 +163,3 @@ async def to_code(config):
                 await climate.register_climate(zoneClimate, climateConfig)
                 await cg.register_component(zoneClimate, climateConfig)
                 cg.add(var.add_ultima_zone(number, zoneClimate))
-

@@ -94,6 +94,14 @@ class Controller {
     uint16_t checksumModbus(const uint8_t *data, uint8_t length);
     /// @brief Checks if current buffer is a valid Modbus RTU frame
     bool isModbusMessage();
+    /// @brief Prints a decoded Modbus RTU summary for current serial buffer
+    void printModbusMessage();
+    /// @brief Prints a compact Actron state snapshot used in capture mode
+    void printCaptureStateSnapshot(uint8_t *data, uint8_t length, const char *sourceTag);
+    /// @brief Prints a compact parsed zone wall message used in capture mode
+    void printCaptureZoneWallMessage(uint8_t zone, uint8_t *data, uint8_t length);
+    /// @brief Prints a compact parsed master-to-zone message used in capture mode
+    void printCaptureZoneMasterMessage(uint8_t zone, uint8_t *data, uint8_t length);
 
 public:
 

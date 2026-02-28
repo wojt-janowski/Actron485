@@ -67,7 +67,7 @@ class LogStream : public Stream {
         size_t write(const uint8_t *data, size_t size) override;
         void flush() override;
     protected:
-        static const int bufferSize = 200;
+        static const int bufferSize = 512;
         char _buffer[bufferSize];
         int _bufferIndex = 0;
 };

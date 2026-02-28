@@ -11,6 +11,7 @@ enum class PrintOutMode: uint8_t {
     StatusOnly,
     ChangedMessages,
     AllMessages,
+    CorrelationCapture,
 };
 
 // Message Type

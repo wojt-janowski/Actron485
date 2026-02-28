@@ -102,7 +102,7 @@ climate:
     ultima: # For ULTIMA Systems only, adds climate controls per zone.
       available: true
       adjust_master_target: true # Adjust master target temperature to allow the targeted zone temperature.
-    logging_mode: CHANGE
+    logging_mode: CHANGE # NONE | STATUS | CHANGE | ALL | CAPTURE
     zones:
       - number: 1
         name: Living
@@ -125,6 +125,7 @@ climate:
 * One command per cycle can be sent (~1s per cycle), with a gap of one cycle for subsequent calls. Different commands are stored and sent out one by one at the end of a cycle. E.g. setting 8 individual zone temperatures, takes 8 seconds to complete.
 * If a command is scheduled to be sent out, but in the mean time another command of the same type is set, the original command will be ignored. E.g. `turn system off` command is scheduled, but before it has time to be sent a `turn system on` command is scheduled, it will replace the off command.
 * If another user is pressing buttons on a wall controller while also a message is being sent via this controller, a race condition could occur and one may override the other. E.g. Wall zone 1 is turned on, at the same time zone 2 is turned on in this controller. Zone 1 or 2 may turn off again.
+* `logging_mode: CAPTURE` is intended for correlation work. It prints compact `CAP ...` lines for both native Actron and Modbus traffic so logs are easier to copy/paste for analysis.
 
 ## Todo
 * Testing! Code is new and largely untested in different scenarios.
@@ -135,4 +136,5 @@ Open issues or merge requests on any bugs found and improvements.
 
 ### Bug Reports
 
-Have `logging_mode: ALL` (for ESPHome configuration) or `printOutMode = Actron485::PrintOutMode::AllMessages;` (for PlaformIO code) and include logs during the period the error occurs. Especially if it's a data being interpreted issue.
+Have `logging_mode: ALL` (full verbose decode) or `logging_mode: CAPTURE` (compact correlation output) for ESPHome configuration.  
+For PlatformIO use `printOutMode = Actron485::PrintOutMode::AllMessages;` or `printOutMode = Actron485::PrintOutMode::CorrelationCapture;` and include logs during the period the error occurs.
