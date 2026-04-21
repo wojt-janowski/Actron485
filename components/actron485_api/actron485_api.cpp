@@ -206,7 +206,19 @@ void Actron485Api::apply_zone_on(uint8_t zone, bool on) {
 }
 void Actron485Api::apply_zone_setpoint(uint8_t zone, double temperature) {
   if (zone < 1 || zone > 8) return;
-  if (demo_mode_) { demo_zone_setpoint_[zone - 1] = (float) temperature; return; }
+  if (demo_mode_) {
+    // Match the Que master's clamp to master-setpoint ±2 °C window, so
+    // demo state behaves like the real system rather than permitting
+    // arbitrary per-zone values. The real firmware path doesn't need
+    // this — the Actron master does the clamping itself.
+    const float lo = demo_setpoint_ - 2.0f;
+    const float hi = demo_setpoint_ + 2.0f;
+    float clamped = (float) temperature;
+    if (clamped < lo) clamped = lo;
+    if (clamped > hi) clamped = hi;
+    demo_zone_setpoint_[zone - 1] = clamped;
+    return;
+  }
   controller()->setZoneSetpointTemperatureCustom(zone, temperature, false);
 }
 void Actron485Api::apply_zone_control(uint8_t zone, bool enabled) {
@@ -274,6 +286,17 @@ void Actron485Api::demo_tick_() {
         demo_zone_setpoint_[i - 1] = zc->target_temperature;
       }
     }
+  }
+
+  // 1b) Clamp every zone setpoint to the master-setpoint ±2 °C window.
+  //     Mirrors the Que master's behavior: moving the master drags any
+  //     zones that were outside the new window back inside it. In live
+  //     mode the Actron master does this itself; we only need it here.
+  const float zone_lo = demo_setpoint_ - 2.0f;
+  const float zone_hi = demo_setpoint_ + 2.0f;
+  for (int i = 0; i < 8; i++) {
+    if (demo_zone_setpoint_[i] < zone_lo) demo_zone_setpoint_[i] = zone_lo;
+    if (demo_zone_setpoint_[i] > zone_hi) demo_zone_setpoint_[i] = zone_hi;
   }
 
   // 2) Drift simulated currents toward per-zone targets.
