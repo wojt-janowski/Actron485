@@ -157,6 +157,20 @@ std::string Actron485Api::build_state_json() {
   for (int i = 1; i <= 8; i++) {
     JsonObject z = zones.add<JsonObject>();
     z["number"] = i;
+    // Names come from the YAML's climate.zones[*].name, which ESPHome
+    // stores as the zone fan entity name. Prefer the Ultima zone-climate
+    // name if available (that's what users will interact with in Que mode),
+    // fall back to the zone fan, final fall-back to "Zone N".
+    std::string name;
+    if (auto *zc = climate_->get_zone_climate(i)) {
+      name = std::string(zc->get_name());
+    } else if (auto *zf = climate_->get_zone_fan(i)) {
+      name = std::string(zf->get_name());
+    }
+    if (name.empty()) {
+      name = "Zone " + std::to_string(i);
+    }
+    z["name"] = name;
     z["on"] = c->getZoneOn(i);
     z["damper"] = c->getZoneDamperPosition(i);
     z["control"] = c->getControlZone(i);
