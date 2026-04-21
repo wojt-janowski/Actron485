@@ -7,6 +7,9 @@
 #include "esphome/core/application.h"
 #include "esphome/core/helpers.h"
 #include "esphome/core/preferences.h"
+#include "esphome/components/actron485/utilities.h"
+#include "esphome/components/actron485/zone_fan.h"
+#include "esphome/components/actron485/zone_climate.h"
 
 #include <esp_http_server.h>
 #include <ArduinoJson.h>
@@ -229,6 +232,44 @@ void Actron485Api::demo_tick_() {
     sum += demo_zone_current_[i];
   }
   demo_current_ = sum / 8.0f;
+
+  // Also push our simulated state into the ESPHome Climate and fan/zone
+  // entities so the built-in web UI and Home Assistant integration stop
+  // showing NaNs. Without this, those entities still poll the real (and
+  // silent) RS485 controller and publish nothing. Rate-limited to ~1 Hz.
+  if (now - demo_last_publish_ms_ < 1000) return;
+  demo_last_publish_ms_ = now;
+  using esphome::actron485::Converter;
+  namespace clm = esphome::climate;
+
+  climate_->current_temperature = demo_current_;
+  climate_->target_temperature = demo_setpoint_;
+  climate_->mode = demo_system_on_
+                      ? Converter::to_climate_mode(demo_op_mode_)
+                      : clm::CLIMATE_MODE_OFF;
+  climate_->fan_mode = Converter::to_fan_mode(demo_fan_);
+  Actron485::CompressorMode cmode = Actron485::CompressorMode::Idle;
+  if (demo_system_on_) {
+    if (demo_op_mode_ == Actron485::OperatingMode::Cool) cmode = Actron485::CompressorMode::Cooling;
+    else if (demo_op_mode_ == Actron485::OperatingMode::Heat) cmode = Actron485::CompressorMode::Heating;
+  }
+  climate_->action = demo_system_on_
+                        ? Converter::to_climate_action(cmode, demo_op_mode_)
+                        : clm::CLIMATE_ACTION_OFF;
+  climate_->publish_state();
+
+  for (int i = 1; i <= 8; i++) {
+    if (auto *zf = climate_->get_zone_fan(i)) {
+      zf->state = demo_zone_on_[i - 1];
+      zf->publish_state();
+    }
+    if (auto *zc = climate_->get_zone_climate(i)) {
+      zc->current_temperature = demo_zone_current_[i - 1];
+      zc->target_temperature = demo_zone_setpoint_[i - 1];
+      zc->mode = demo_zone_on_[i - 1] ? climate_->mode : clm::CLIMATE_MODE_OFF;
+      zc->publish_state();
+    }
+  }
 }
 
 void Actron485Api::note_zone_temperature_update(uint8_t zone) {

@@ -87,6 +87,7 @@ class Actron485Api : public Component {
   float demo_zone_setpoint_[8]{22.0f, 22.0f, 22.0f, 22.0f, 22.0f, 22.0f, 22.0f, 22.0f};
   float demo_zone_current_[8]{21.4f, 21.4f, 21.4f, 21.4f, 21.4f, 21.4f, 21.4f, 21.4f};
   unsigned long demo_last_tick_ms_{0};
+  unsigned long demo_last_publish_ms_{0};
   void demo_tick_();
 
   // Zone name overrides persisted to flash via ESPHome preferences.
