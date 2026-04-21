@@ -99,8 +99,12 @@ void Actron485Climate::power_off() {
     actron_controller.setSystemOn(false);
 }
 
-void Actron485Climate::power_toggle() { 
+void Actron485Climate::power_toggle() {
     actron_controller.setSystemOn(!actron_controller.getSystemOn());
+}
+
+Actron485::Controller *Actron485Climate::get_controller() {
+    return &actron_controller;
 }
 
 void Actron485Climate::add_zone(int number, Actron485ZoneFan *fan) {

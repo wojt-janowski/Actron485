@@ -92,6 +92,20 @@ class Actron485Climate : public climate::Climate, public Component {
         void power_off();
         void power_toggle();
 
+        // Accessor for external components (e.g. actron485_api) that need to
+        // read/write the underlying Actron485 controller state directly.
+        Actron485::Controller *get_controller();
+
+        // Snapshot helpers for the API layer to read zone fan assignments
+        // without re-plumbing them from YAML.
+        Actron485ZoneFan *get_zone_fan(int number) const {
+            return (number >= 1 && number <= 8) ? zones_[number - 1] : nullptr;
+        }
+        Actron485ZoneClimate *get_zone_climate(int number) const {
+            return (number >= 1 && number <= 8) ? zone_climates_[number - 1] : nullptr;
+        }
+        bool has_ultima() const { return has_ultima_; }
+
     protected:
         InternalGPIOPin *we_pin_ = NULL;
         UARTStream stream_;
