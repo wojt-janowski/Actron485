@@ -122,6 +122,7 @@ class Actron485ApiHandler : public AsyncWebHandler {
   void handle_info_(AsyncWebServerRequest *request);
   void handle_state_(AsyncWebServerRequest *request);
   void handle_diagnostics_(AsyncWebServerRequest *request);
+  void handle_demo_(AsyncWebServerRequest *request, const std::string &body);
   void handle_power_(AsyncWebServerRequest *request, const std::string &body);
   void handle_mode_(AsyncWebServerRequest *request, const std::string &body);
   void handle_fan_(AsyncWebServerRequest *request, const std::string &body);

@@ -456,6 +456,7 @@ void Actron485ApiHandler::handleRequest(AsyncWebServerRequest *request) {
     if (url == "/api/v1/mode") { handle_mode_(request, body); return; }
     if (url == "/api/v1/fan") { handle_fan_(request, body); return; }
     if (url == "/api/v1/setpoint") { handle_setpoint_(request, body); return; }
+    if (url == "/api/v1/demo") { handle_demo_(request, body); return; }
 
     const std::string zones_prefix = "/api/v1/zones/";
     if (url.rfind(zones_prefix, 0) == 0) {
@@ -512,6 +513,31 @@ void Actron485ApiHandler::handle_info_(AsyncWebServerRequest *request) {
 
   std::string out;
   serializeJson(doc, out);
+  send_json_(request, 200, out);
+}
+
+// POST /api/v1/demo  {"enabled": bool}
+// Toggles the firmware's demo simulator at runtime. SESSION-ONLY — a reboot
+// restores whatever the YAML was flashed with. Intended as a dev switch so
+// the mobile app can flip between simulated and real state without
+// reflashing. Returns {"demo": <new state>}.
+void Actron485ApiHandler::handle_demo_(AsyncWebServerRequest *request, const std::string &body) {
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) { send_error_(request, 400, "invalid_json"); return; }
+  if (!doc["enabled"].is<bool>()) { send_error_(request, 400, "missing_enabled"); return; }
+  bool enabled = doc["enabled"].as<bool>();
+  if (enabled != parent_->demo_mode()) {
+    if (enabled) {
+      ESP_LOGW(TAG, "Switching to DEMO mode at runtime (session-only)");
+    } else {
+      ESP_LOGI(TAG, "Exiting DEMO mode at runtime");
+    }
+    parent_->set_demo_mode(enabled);
+  }
+  JsonDocument resp;
+  resp["demo"] = parent_->demo_mode();
+  std::string out;
+  serializeJson(resp, out);
   send_json_(request, 200, out);
 }
 
