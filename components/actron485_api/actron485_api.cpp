@@ -5,6 +5,8 @@
 
 #include "esphome/core/log.h"
 #include "esphome/core/application.h"
+#include "esphome/core/helpers.h"
+#include "esphome/core/preferences.h"
 
 #include <esp_http_server.h>
 #include <ArduinoJson.h>
@@ -90,7 +92,58 @@ void Actron485Api::setup() {
   }
   handler_ = new Actron485ApiHandler(this);
   base->add_handler(handler_);
+  this->load_zone_names_();
   ESP_LOGCONFIG(TAG, "Actron485 API mounted at /api/v1/* on port %u", base->get_port());
+}
+
+void Actron485Api::load_zone_names_() {
+  // Stable hash for the preference slot. Keep this constant across
+  // firmware builds or you'll lose saved names.
+  uint32_t hash = fnv1_hash(std::string("actron485_api_zone_names_v1"));
+  zone_names_pref_ = global_preferences->make_preference<ZoneNamesBlob>(hash);
+  ZoneNamesBlob blob{};
+  if (zone_names_pref_.load(&blob)) {
+    for (int i = 0; i < 8; i++) {
+      // Defensive: ensure null-termination even if flash was corrupted.
+      blob.names[i][ZONE_NAME_MAX] = '\0';
+      zone_name_overrides_[i] = std::string(blob.names[i]);
+    }
+  }
+}
+
+void Actron485Api::save_zone_names_() {
+  ZoneNamesBlob blob{};
+  for (int i = 0; i < 8; i++) {
+    const auto &s = zone_name_overrides_[i];
+    size_t n = std::min(s.size(), ZONE_NAME_MAX);
+    memcpy(blob.names[i], s.data(), n);
+    blob.names[i][n] = '\0';
+  }
+  zone_names_pref_.save(&blob);
+  global_preferences->sync();
+}
+
+std::string Actron485Api::get_zone_display_name(int zone) {
+  if (zone < 1 || zone > 8) return std::string();
+  const auto &override_name = zone_name_overrides_[zone - 1];
+  if (!override_name.empty()) return override_name;
+  if (auto *zc = climate_->get_zone_climate(zone)) {
+    auto s = std::string(zc->get_name());
+    if (!s.empty()) return s;
+  }
+  if (auto *zf = climate_->get_zone_fan(zone)) {
+    auto s = std::string(zf->get_name());
+    if (!s.empty()) return s;
+  }
+  return "Zone " + std::to_string(zone);
+}
+
+bool Actron485Api::set_zone_name_override(uint8_t zone, const std::string &name) {
+  if (zone < 1 || zone > 8) return false;
+  if (name.size() > ZONE_NAME_MAX) return false;
+  zone_name_overrides_[zone - 1] = name;
+  this->save_zone_names_();
+  return true;
 }
 
 void Actron485Api::dump_config() {
@@ -157,20 +210,7 @@ std::string Actron485Api::build_state_json() {
   for (int i = 1; i <= 8; i++) {
     JsonObject z = zones.add<JsonObject>();
     z["number"] = i;
-    // Names come from the YAML's climate.zones[*].name, which ESPHome
-    // stores as the zone fan entity name. Prefer the Ultima zone-climate
-    // name if available (that's what users will interact with in Que mode),
-    // fall back to the zone fan, final fall-back to "Zone N".
-    std::string name;
-    if (auto *zc = climate_->get_zone_climate(i)) {
-      name = std::string(zc->get_name());
-    } else if (auto *zf = climate_->get_zone_fan(i)) {
-      name = std::string(zf->get_name());
-    }
-    if (name.empty()) {
-      name = "Zone " + std::to_string(i);
-    }
-    z["name"] = name;
+    z["name"] = this->get_zone_display_name(i);
     z["on"] = c->getZoneOn(i);
     z["damper"] = c->getZoneDamperPosition(i);
     z["control"] = c->getControlZone(i);
@@ -323,6 +363,10 @@ void Actron485ApiHandler::handleRequest(AsyncWebServerRequest *request) {
         handle_zone_temperature_(request, zone, body);
         return;
       }
+      if (subpath == "name") {
+        handle_zone_name_(request, zone, body);
+        return;
+      }
       send_error_(request, 404, "not_found");
       return;
     }
@@ -341,6 +385,13 @@ void Actron485ApiHandler::handle_info_(AsyncWebServerRequest *request) {
   root["has_ultima"] = parent_->climate()->has_ultima();
   root["zone_count"] = 8;
   root["uptime_ms"] = (unsigned long) millis();
+  // Static zone metadata — safe to return even when the RS485 bus is silent.
+  JsonArray zones = root["zones"].to<JsonArray>();
+  for (int i = 1; i <= 8; i++) {
+    JsonObject z = zones.add<JsonObject>();
+    z["number"] = i;
+    z["name"] = parent_->get_zone_display_name(i);
+  }
 
   std::string out;
   serializeJson(doc, out);
@@ -471,6 +522,30 @@ void Actron485ApiHandler::handle_zone_temperature_(AsyncWebServerRequest *reques
   parent_->controller()->setZoneCurrentTemperature((uint8_t) zone, t);
   parent_->note_zone_temperature_update((uint8_t) zone);
   send_json_(request, 202, "{\"status\":\"queued\"}");
+}
+
+// POST /api/v1/zones/{n}/name  {"name": "Living Room"}
+// Persists a display-name override for the zone to flash (ESPHome
+// preferences). The override is returned in /info and /state in place of
+// the yaml-configured name. Pass an empty string to clear the override.
+// Applies immediately (returns 200, not 202 — it's local state, not an
+// RS485 command).
+void Actron485ApiHandler::handle_zone_name_(AsyncWebServerRequest *request, int zone, const std::string &body) {
+  if (zone < 1 || zone > 8) { send_error_(request, 400, "invalid_zone"); return; }
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) { send_error_(request, 400, "invalid_json"); return; }
+  if (!doc["name"].is<const char *>()) { send_error_(request, 400, "missing_name"); return; }
+  std::string name = doc["name"].as<const char *>();
+  if (!parent_->set_zone_name_override((uint8_t) zone, name)) {
+    send_error_(request, 400, "name_too_long");
+    return;
+  }
+  JsonDocument resp;
+  resp["number"] = zone;
+  resp["name"] = parent_->get_zone_display_name(zone);
+  std::string body_out;
+  serializeJson(resp, body_out);
+  send_json_(request, 200, body_out);
 }
 
 }  // namespace actron485_api

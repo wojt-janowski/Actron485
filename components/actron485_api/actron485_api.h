@@ -3,6 +3,7 @@
 #include <string>
 
 #include "esphome/core/component.h"
+#include "esphome/core/preferences.h"
 #include "esphome/components/web_server_base/web_server_base.h"
 #include "esphome/components/actron485/actron485_climate.h"
 #include "Actron485.h"
@@ -26,6 +27,15 @@ class Actron485Api : public Component {
   // Called by the temperature handler on each successful POST.
   void note_zone_temperature_update(uint8_t zone);
 
+  // Returns the display name for a zone (1..8): override (if set) > ESPHome
+  // entity name > "Zone N".
+  std::string get_zone_display_name(int zone);
+
+  // Persists an override name for a zone. Empty string clears the override
+  // (the ESPHome entity name is used again). Returns false if zone is
+  // out of range or the name is too long.
+  bool set_zone_name_override(uint8_t zone, const std::string &name);
+
   Actron485::Controller *controller() { return climate_->get_controller(); }
   actron485::Actron485Climate *climate() { return climate_; }
   const std::string &auth_token() const { return auth_token_; }
@@ -43,6 +53,17 @@ class Actron485Api : public Component {
   uint32_t sensor_stale_timeout_ms_{600000};
   unsigned long last_temp_update_ms_[8]{};
   unsigned long last_stale_check_ms_{0};
+
+  // Zone name overrides persisted to flash via ESPHome preferences.
+  // Empty string means "no override; use the ESPHome entity name".
+  static constexpr size_t ZONE_NAME_MAX = 31;
+  struct ZoneNamesBlob {
+    char names[8][ZONE_NAME_MAX + 1];
+  };
+  std::string zone_name_overrides_[8];
+  ESPPreferenceObject zone_names_pref_;
+  void load_zone_names_();
+  void save_zone_names_();
 };
 
 class Actron485ApiHandler : public AsyncWebHandler {
@@ -73,6 +94,7 @@ class Actron485ApiHandler : public AsyncWebHandler {
   void handle_zone_(AsyncWebServerRequest *request, int zone, const std::string &body);
   void handle_zone_control_(AsyncWebServerRequest *request, int zone, const std::string &body);
   void handle_zone_temperature_(AsyncWebServerRequest *request, int zone, const std::string &body);
+  void handle_zone_name_(AsyncWebServerRequest *request, int zone, const std::string &body);
 };
 
 }  // namespace actron485_api
