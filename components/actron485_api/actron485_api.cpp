@@ -165,16 +165,38 @@ void Actron485Api::dump_config() {
 
 // -------- Write wrappers: controller in normal mode, local state in demo --------
 
+// In demo mode the apply_* writers mutate the ESPHome Climate/fan
+// entities directly, then publish. This keeps the web UI, Home Assistant
+// integration, and the REST API in sync — no matter who triggered the
+// change (API POST, web UI drag, HA automation), everyone sees it.
 void Actron485Api::apply_system_on(bool on) {
-  if (demo_mode_) { demo_system_on_ = on; return; }
+  if (demo_mode_) {
+    demo_system_on_ = on;
+    climate_->mode = on ? actron485::Converter::to_climate_mode(demo_op_mode_)
+                        : climate::CLIMATE_MODE_OFF;
+    climate_->publish_state();
+    return;
+  }
   controller()->setSystemOn(on);
 }
 void Actron485Api::apply_operating_mode(Actron485::OperatingMode mode) {
-  if (demo_mode_) { demo_op_mode_ = mode; return; }
+  if (demo_mode_) {
+    demo_op_mode_ = mode;
+    // Off/OffCool/OffHeat/OffAuto map to CLIMATE_MODE_OFF per Converter.
+    climate_->mode = actron485::Converter::to_climate_mode(mode);
+    demo_system_on_ = (climate_->mode != climate::CLIMATE_MODE_OFF);
+    climate_->publish_state();
+    return;
+  }
   controller()->setOperatingMode(mode);
 }
 void Actron485Api::apply_fan_speed(Actron485::FanMode mode) {
-  if (demo_mode_) { demo_fan_ = mode; return; }
+  if (demo_mode_) {
+    demo_fan_ = mode;
+    climate_->fan_mode = actron485::Converter::to_fan_mode(mode);
+    climate_->publish_state();
+    return;
+  }
   controller()->setFanSpeed(mode);
 }
 void Actron485Api::apply_continuous_fan(bool on) {
@@ -182,17 +204,36 @@ void Actron485Api::apply_continuous_fan(bool on) {
   controller()->setContinuousFanMode(on);
 }
 void Actron485Api::apply_master_setpoint(double temperature) {
-  if (demo_mode_) { demo_setpoint_ = (float) temperature; return; }
+  if (demo_mode_) {
+    demo_setpoint_ = (float) temperature;
+    climate_->target_temperature = (float) temperature;
+    climate_->publish_state();
+    return;
+  }
   controller()->setMasterSetpoint(temperature);
 }
 void Actron485Api::apply_zone_on(uint8_t zone, bool on) {
   if (zone < 1 || zone > 8) return;
-  if (demo_mode_) { demo_zone_on_[zone - 1] = on; return; }
+  if (demo_mode_) {
+    demo_zone_on_[zone - 1] = on;
+    if (auto *zf = climate_->get_zone_fan(zone)) {
+      zf->state = on;
+      zf->publish_state();
+    }
+    return;
+  }
   controller()->setZoneOn(zone, on);
 }
 void Actron485Api::apply_zone_setpoint(uint8_t zone, double temperature) {
   if (zone < 1 || zone > 8) return;
-  if (demo_mode_) { demo_zone_setpoint_[zone - 1] = (float) temperature; return; }
+  if (demo_mode_) {
+    demo_zone_setpoint_[zone - 1] = (float) temperature;
+    if (auto *zc = climate_->get_zone_climate(zone)) {
+      zc->target_temperature = (float) temperature;
+      zc->publish_state();
+    }
+    return;
+  }
   controller()->setZoneSetpointTemperatureCustom(zone, temperature, false);
 }
 void Actron485Api::apply_zone_control(uint8_t zone, bool enabled) {
@@ -202,7 +243,14 @@ void Actron485Api::apply_zone_control(uint8_t zone, bool enabled) {
 }
 void Actron485Api::apply_zone_current_temperature(uint8_t zone, double temperature) {
   if (zone < 1 || zone > 8) return;
-  if (demo_mode_) { demo_zone_current_[zone - 1] = (float) temperature; return; }
+  if (demo_mode_) {
+    demo_zone_current_[zone - 1] = (float) temperature;
+    if (auto *zc = climate_->get_zone_climate(zone)) {
+      zc->current_temperature = (float) temperature;
+      zc->publish_state();
+    }
+    return;
+  }
   controller()->setZoneCurrentTemperature(zone, temperature);
 }
 
@@ -211,17 +259,56 @@ bool Actron485Api::state_receiving_data() {
   return controller()->receivingData();
 }
 
-// Drift zone currents toward their setpoints (or toward master setpoint if the
-// zone has no setpoint set / isn't controlled), so the mobile app sees live-ish
-// movement in demo mode. Master current is the mean of zone currents.
+// Drift zone currents toward their setpoints and publish the simulator's
+// state. The Climate/fan entities are authoritative for user-visible
+// settings (setpoint, mode, fan, zone on/off) — we READ them at the start
+// of each tick so web-UI or Home-Assistant changes stick, and only WRITE
+// back the fields we simulate (current_temperature, action).
 void Actron485Api::demo_tick_() {
+  using esphome::actron485::Converter;
+  namespace clm = esphome::climate;
+
   unsigned long now = millis();
   if (demo_last_tick_ms_ == 0) { demo_last_tick_ms_ = now; return; }
   float dt = (now - demo_last_tick_ms_) / 1000.0f;
   demo_last_tick_ms_ = now;
   if (dt <= 0) return;
 
-  const float rate = 0.05f;  // °C per second toward target
+  // 1) Sync *from* the Climate entity so user changes from the web UI /
+  //    HA propagate into our demo state. Also seed defaults the first
+  //    time through if the entity hasn't been published yet.
+  if (!std::isnan(climate_->target_temperature)) {
+    demo_setpoint_ = climate_->target_temperature;
+  } else {
+    climate_->target_temperature = demo_setpoint_;
+  }
+  if (climate_->mode == clm::CLIMATE_MODE_OFF) {
+    demo_system_on_ = false;
+  } else {
+    demo_system_on_ = true;
+    demo_op_mode_ = Converter::to_actron_operating_mode(climate_->mode);
+  }
+  if (climate_->fan_mode.has_value()) {
+    demo_fan_ = Converter::to_actron_fan_mode(*climate_->fan_mode);
+  } else {
+    climate_->fan_mode = Converter::to_fan_mode(demo_fan_);
+  }
+
+  for (int i = 1; i <= 8; i++) {
+    if (auto *zf = climate_->get_zone_fan(i)) {
+      demo_zone_on_[i - 1] = zf->state;
+    }
+    if (auto *zc = climate_->get_zone_climate(i)) {
+      if (!std::isnan(zc->target_temperature)) {
+        demo_zone_setpoint_[i - 1] = zc->target_temperature;
+      } else {
+        zc->target_temperature = demo_zone_setpoint_[i - 1];
+      }
+    }
+  }
+
+  // 2) Drift simulated currents toward per-zone targets.
+  const float rate = 0.05f;  // °C per second
   float sum = 0;
   for (int i = 0; i < 8; i++) {
     float target = demo_zone_setpoint_[i];
@@ -233,21 +320,12 @@ void Actron485Api::demo_tick_() {
   }
   demo_current_ = sum / 8.0f;
 
-  // Also push our simulated state into the ESPHome Climate and fan/zone
-  // entities so the built-in web UI and Home Assistant integration stop
-  // showing NaNs. Without this, those entities still poll the real (and
-  // silent) RS485 controller and publish nothing. Rate-limited to ~1 Hz.
+  // 3) Publish at most once per second — cheap UI refresh rate, avoids
+  //    spamming the ESPHome subscription machinery.
   if (now - demo_last_publish_ms_ < 1000) return;
   demo_last_publish_ms_ = now;
-  using esphome::actron485::Converter;
-  namespace clm = esphome::climate;
 
   climate_->current_temperature = demo_current_;
-  climate_->target_temperature = demo_setpoint_;
-  climate_->mode = demo_system_on_
-                      ? Converter::to_climate_mode(demo_op_mode_)
-                      : clm::CLIMATE_MODE_OFF;
-  climate_->fan_mode = Converter::to_fan_mode(demo_fan_);
   Actron485::CompressorMode cmode = Actron485::CompressorMode::Idle;
   if (demo_system_on_) {
     if (demo_op_mode_ == Actron485::OperatingMode::Cool) cmode = Actron485::CompressorMode::Cooling;
@@ -259,16 +337,12 @@ void Actron485Api::demo_tick_() {
   climate_->publish_state();
 
   for (int i = 1; i <= 8; i++) {
-    if (auto *zf = climate_->get_zone_fan(i)) {
-      zf->state = demo_zone_on_[i - 1];
-      zf->publish_state();
-    }
     if (auto *zc = climate_->get_zone_climate(i)) {
       zc->current_temperature = demo_zone_current_[i - 1];
-      zc->target_temperature = demo_zone_setpoint_[i - 1];
-      zc->mode = demo_zone_on_[i - 1] ? climate_->mode : clm::CLIMATE_MODE_OFF;
       zc->publish_state();
     }
+    // Zone fans are binary and already publish themselves on user toggle;
+    // no simulated "action" to republish.
   }
 }
 
