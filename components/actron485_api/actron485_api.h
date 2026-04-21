@@ -88,6 +88,15 @@ class Actron485Api : public Component {
   float demo_zone_current_[8]{21.4f, 21.4f, 21.4f, 21.4f, 21.4f, 21.4f, 21.4f, 21.4f};
   unsigned long demo_last_tick_ms_{0};
   unsigned long demo_last_publish_ms_{0};
+  // "Last value we wrote into the Climate/fan entities from demo_tick".
+  // Used at the next tick to detect web-UI-driven changes (where the
+  // current climate_ value differs from what we last pushed) vs
+  // API-driven changes (where demo_* diverges but climate_ is unchanged).
+  float demo_last_pub_setpoint_{NAN};
+  int demo_last_pub_mode_{-1};
+  int demo_last_pub_fan_{-1};
+  bool demo_last_pub_zone_on_[8]{};
+  float demo_last_pub_zone_setpoint_[8]{NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN};
   void demo_tick_();
 
   // Zone name overrides persisted to flash via ESPHome preferences.
