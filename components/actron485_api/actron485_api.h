@@ -18,6 +18,8 @@ class Actron485Api : public Component {
   void set_climate(actron485::Actron485Climate *climate) { climate_ = climate; }
   void set_auth_token(const std::string &token) { auth_token_ = token; }
   void set_sensor_stale_timeout_ms(uint32_t ms) { sensor_stale_timeout_ms_ = ms; }
+  void set_demo_mode(bool on) { demo_mode_ = on; }
+  bool demo_mode() const { return demo_mode_; }
 
   void setup() override;
   void loop() override;
@@ -43,6 +45,22 @@ class Actron485Api : public Component {
   // Serialized state snapshot used by both GET /state and (future) streaming.
   std::string build_state_json();
 
+  // Write-path wrappers. In normal mode these delegate to the Actron485
+  // controller. In demo mode they mutate only the simulator's state and
+  // never touch the RS485 bus.
+  void apply_system_on(bool on);
+  void apply_operating_mode(Actron485::OperatingMode mode);
+  void apply_fan_speed(Actron485::FanMode mode);
+  void apply_continuous_fan(bool on);
+  void apply_master_setpoint(double temperature);
+  void apply_zone_on(uint8_t zone, bool on);
+  void apply_zone_setpoint(uint8_t zone, double temperature);
+  void apply_zone_control(uint8_t zone, bool enabled);
+  void apply_zone_current_temperature(uint8_t zone, double temperature);
+
+  // State accessor that respects demo mode.
+  bool state_receiving_data();
+
  protected:
   actron485::Actron485Climate *climate_{nullptr};
   std::string auth_token_;  // empty = no auth
@@ -53,6 +71,23 @@ class Actron485Api : public Component {
   uint32_t sensor_stale_timeout_ms_{600000};
   unsigned long last_temp_update_ms_[8]{};
   unsigned long last_stale_check_ms_{0};
+
+  // ---- Demo-mode simulation state ----
+  // Only used when demo_mode_ is true. On a real device these are all
+  // ignored and the Actron485 controller owns the state.
+  bool demo_mode_{false};
+  bool demo_system_on_{false};
+  Actron485::OperatingMode demo_op_mode_{Actron485::OperatingMode::Off};
+  Actron485::FanMode demo_fan_{Actron485::FanMode::Esp};
+  bool demo_continuous_fan_{false};
+  float demo_setpoint_{22.0f};
+  float demo_current_{21.4f};
+  bool demo_zone_on_[8]{};
+  bool demo_zone_control_[8]{};
+  float demo_zone_setpoint_[8]{22.0f, 22.0f, 22.0f, 22.0f, 22.0f, 22.0f, 22.0f, 22.0f};
+  float demo_zone_current_[8]{21.4f, 21.4f, 21.4f, 21.4f, 21.4f, 21.4f, 21.4f, 21.4f};
+  unsigned long demo_last_tick_ms_{0};
+  void demo_tick_();
 
   // Zone name overrides persisted to flash via ESPHome preferences.
   // Empty string means "no override; use the ESPHome entity name".

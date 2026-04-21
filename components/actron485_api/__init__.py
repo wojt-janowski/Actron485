@@ -6,6 +6,7 @@ from esphome.const import CONF_ID
 CONF_CLIMATE_ID = "climate_id"
 CONF_AUTH_TOKEN = "auth_token"
 CONF_SENSOR_STALE_TIMEOUT = "sensor_stale_timeout"
+CONF_DEMO_MODE = "demo_mode"
 
 AUTO_LOAD = ["web_server_base"]
 DEPENDENCIES = ["web_server_base", "climate"]
@@ -28,6 +29,10 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(
             CONF_SENSOR_STALE_TIMEOUT, default="10min"
         ): cv.positive_time_period_milliseconds,
+        # If true, the API serves simulated state and drops any outbound
+        # RS485 writes so the firmware can run safely on a bench T-CAN485
+        # with no bus connection. Intended for mobile app end-to-end tests.
+        cv.Optional(CONF_DEMO_MODE, default=False): cv.boolean,
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -43,6 +48,7 @@ async def to_code(config):
         cg.add(var.set_auth_token(config[CONF_AUTH_TOKEN]))
 
     cg.add(var.set_sensor_stale_timeout_ms(config[CONF_SENSOR_STALE_TIMEOUT]))
+    cg.add(var.set_demo_mode(config[CONF_DEMO_MODE]))
 
     # Pulled in by ESPHome's json component transitively, but declare
     # explicitly to make the dependency obvious and pin a major version.

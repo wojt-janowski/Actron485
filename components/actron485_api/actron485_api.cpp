@@ -154,6 +154,81 @@ void Actron485Api::dump_config() {
   } else {
     ESP_LOGCONFIG(TAG, "  Sensor stale timeout: %u ms", sensor_stale_timeout_ms_);
   }
+  if (demo_mode_) {
+    ESP_LOGW(TAG, "  !!! DEMO MODE ENABLED — NOT connected to any AC !!!");
+    ESP_LOGW(TAG, "  !!! API returns simulated state; RS485 writes suppressed !!!");
+  }
+}
+
+// -------- Write wrappers: controller in normal mode, local state in demo --------
+
+void Actron485Api::apply_system_on(bool on) {
+  if (demo_mode_) { demo_system_on_ = on; return; }
+  controller()->setSystemOn(on);
+}
+void Actron485Api::apply_operating_mode(Actron485::OperatingMode mode) {
+  if (demo_mode_) { demo_op_mode_ = mode; return; }
+  controller()->setOperatingMode(mode);
+}
+void Actron485Api::apply_fan_speed(Actron485::FanMode mode) {
+  if (demo_mode_) { demo_fan_ = mode; return; }
+  controller()->setFanSpeed(mode);
+}
+void Actron485Api::apply_continuous_fan(bool on) {
+  if (demo_mode_) { demo_continuous_fan_ = on; return; }
+  controller()->setContinuousFanMode(on);
+}
+void Actron485Api::apply_master_setpoint(double temperature) {
+  if (demo_mode_) { demo_setpoint_ = (float) temperature; return; }
+  controller()->setMasterSetpoint(temperature);
+}
+void Actron485Api::apply_zone_on(uint8_t zone, bool on) {
+  if (zone < 1 || zone > 8) return;
+  if (demo_mode_) { demo_zone_on_[zone - 1] = on; return; }
+  controller()->setZoneOn(zone, on);
+}
+void Actron485Api::apply_zone_setpoint(uint8_t zone, double temperature) {
+  if (zone < 1 || zone > 8) return;
+  if (demo_mode_) { demo_zone_setpoint_[zone - 1] = (float) temperature; return; }
+  controller()->setZoneSetpointTemperatureCustom(zone, temperature, false);
+}
+void Actron485Api::apply_zone_control(uint8_t zone, bool enabled) {
+  if (zone < 1 || zone > 8) return;
+  if (demo_mode_) { demo_zone_control_[zone - 1] = enabled; return; }
+  controller()->setControlZone(zone, enabled);
+}
+void Actron485Api::apply_zone_current_temperature(uint8_t zone, double temperature) {
+  if (zone < 1 || zone > 8) return;
+  if (demo_mode_) { demo_zone_current_[zone - 1] = (float) temperature; return; }
+  controller()->setZoneCurrentTemperature(zone, temperature);
+}
+
+bool Actron485Api::state_receiving_data() {
+  if (demo_mode_) return true;
+  return controller()->receivingData();
+}
+
+// Drift zone currents toward their setpoints (or toward master setpoint if the
+// zone has no setpoint set / isn't controlled), so the mobile app sees live-ish
+// movement in demo mode. Master current is the mean of zone currents.
+void Actron485Api::demo_tick_() {
+  unsigned long now = millis();
+  if (demo_last_tick_ms_ == 0) { demo_last_tick_ms_ = now; return; }
+  float dt = (now - demo_last_tick_ms_) / 1000.0f;
+  demo_last_tick_ms_ = now;
+  if (dt <= 0) return;
+
+  const float rate = 0.05f;  // °C per second toward target
+  float sum = 0;
+  for (int i = 0; i < 8; i++) {
+    float target = demo_zone_setpoint_[i];
+    if (!demo_system_on_) target = 20.0f + (i * 0.1f);  // ambient drift when off
+    float delta = target - demo_zone_current_[i];
+    float step = std::max(-rate * dt, std::min(rate * dt, delta));
+    demo_zone_current_[i] += step;
+    sum += demo_zone_current_[i];
+  }
+  demo_current_ = sum / 8.0f;
 }
 
 void Actron485Api::note_zone_temperature_update(uint8_t zone) {
@@ -167,6 +242,10 @@ void Actron485Api::note_zone_temperature_update(uint8_t zone) {
 }
 
 void Actron485Api::loop() {
+  if (demo_mode_) {
+    this->demo_tick_();
+    return;  // nothing else to do — the real bus isn't in play
+  }
   if (sensor_stale_timeout_ms_ == 0) return;
   unsigned long now = millis();
   // Check at most once per second — cheap but avoids per-tick overhead.
@@ -188,35 +267,72 @@ void Actron485Api::loop() {
 }
 
 std::string Actron485Api::build_state_json() {
-  auto *c = controller();
   JsonDocument doc;
   auto root = doc.to<JsonObject>();
 
   // Monotonic ms since boot; the mobile app can compute freshness by diffing
   // two snapshots' updated_at_ms or comparing to its own request clock.
   root["updated_at_ms"] = (unsigned long) millis();
-  root["status_received_ms"] = c->statusLastReceivedTime;
-  root["system_on"] = c->getSystemOn();
-  root["mode"] = operating_mode_to_string(c->getOperatingMode());
-  root["fan"] = fan_mode_to_string(c->getFanSpeed());
-  root["fan_running"] = fan_mode_to_string(c->getRunningFanSpeed());
-  root["continuous_fan"] = c->getContinuousFanMode();
-  root["compressor"] = compressor_to_string(c->getCompressorMode());
-  root["setpoint"] = c->getMasterSetpoint();
-  root["current_temperature"] = c->getMasterCurrentTemperature();
-  root["has_ultima"] = climate_->has_ultima();
 
-  JsonArray zones = root["zones"].to<JsonArray>();
-  for (int i = 1; i <= 8; i++) {
-    JsonObject z = zones.add<JsonObject>();
-    z["number"] = i;
-    z["name"] = this->get_zone_display_name(i);
-    z["on"] = c->getZoneOn(i);
-    z["damper"] = c->getZoneDamperPosition(i);
-    z["control"] = c->getControlZone(i);
-    if (climate_->has_ultima()) {
-      z["setpoint"] = c->getZoneSetpointTemperature(i);
-      z["current_temperature"] = c->getZoneCurrentTemperature(i);
+  if (demo_mode_) {
+    root["status_received_ms"] = (unsigned long) millis();
+    root["system_on"] = demo_system_on_;
+    root["mode"] = operating_mode_to_string(demo_op_mode_);
+    root["fan"] = fan_mode_to_string(demo_fan_);
+    root["fan_running"] = fan_mode_to_string(demo_fan_);
+    root["continuous_fan"] = demo_continuous_fan_;
+    // Very simple "compressor" rule — if the system is on and in a thermal
+    // mode, report the appropriate direction. Good enough to exercise
+    // status/action indicators in the app.
+    const char *compressor = "idle";
+    if (demo_system_on_) {
+      if (demo_op_mode_ == Actron485::OperatingMode::Cool) compressor = "cooling";
+      else if (demo_op_mode_ == Actron485::OperatingMode::Heat) compressor = "heating";
+    }
+    root["compressor"] = compressor;
+    root["setpoint"] = demo_setpoint_;
+    root["current_temperature"] = demo_current_;
+    root["has_ultima"] = climate_->has_ultima();
+    root["demo"] = true;
+
+    JsonArray zones = root["zones"].to<JsonArray>();
+    for (int i = 1; i <= 8; i++) {
+      JsonObject z = zones.add<JsonObject>();
+      z["number"] = i;
+      z["name"] = this->get_zone_display_name(i);
+      z["on"] = demo_zone_on_[i - 1];
+      z["damper"] = demo_zone_on_[i - 1] ? 1.0 : 0.0;
+      z["control"] = demo_zone_control_[i - 1];
+      if (climate_->has_ultima()) {
+        z["setpoint"] = demo_zone_setpoint_[i - 1];
+        z["current_temperature"] = demo_zone_current_[i - 1];
+      }
+    }
+  } else {
+    auto *c = controller();
+    root["status_received_ms"] = c->statusLastReceivedTime;
+    root["system_on"] = c->getSystemOn();
+    root["mode"] = operating_mode_to_string(c->getOperatingMode());
+    root["fan"] = fan_mode_to_string(c->getFanSpeed());
+    root["fan_running"] = fan_mode_to_string(c->getRunningFanSpeed());
+    root["continuous_fan"] = c->getContinuousFanMode();
+    root["compressor"] = compressor_to_string(c->getCompressorMode());
+    root["setpoint"] = c->getMasterSetpoint();
+    root["current_temperature"] = c->getMasterCurrentTemperature();
+    root["has_ultima"] = climate_->has_ultima();
+
+    JsonArray zones = root["zones"].to<JsonArray>();
+    for (int i = 1; i <= 8; i++) {
+      JsonObject z = zones.add<JsonObject>();
+      z["number"] = i;
+      z["name"] = this->get_zone_display_name(i);
+      z["on"] = c->getZoneOn(i);
+      z["damper"] = c->getZoneDamperPosition(i);
+      z["control"] = c->getControlZone(i);
+      if (climate_->has_ultima()) {
+        z["setpoint"] = c->getZoneSetpointTemperature(i);
+        z["current_temperature"] = c->getZoneCurrentTemperature(i);
+      }
     }
   }
 
@@ -385,6 +501,7 @@ void Actron485ApiHandler::handle_info_(AsyncWebServerRequest *request) {
   root["has_ultima"] = parent_->climate()->has_ultima();
   root["zone_count"] = 8;
   root["uptime_ms"] = (unsigned long) millis();
+  root["demo"] = parent_->demo_mode();
   // Static zone metadata — safe to return even when the RS485 bus is silent.
   JsonArray zones = root["zones"].to<JsonArray>();
   for (int i = 1; i <= 8; i++) {
@@ -399,7 +516,7 @@ void Actron485ApiHandler::handle_info_(AsyncWebServerRequest *request) {
 }
 
 void Actron485ApiHandler::handle_state_(AsyncWebServerRequest *request) {
-  if (!parent_->controller()->receivingData()) {
+  if (!parent_->state_receiving_data()) {
     send_error_(request, 409, "rs485_not_receiving");
     return;
   }
@@ -407,15 +524,25 @@ void Actron485ApiHandler::handle_state_(AsyncWebServerRequest *request) {
 }
 
 void Actron485ApiHandler::handle_diagnostics_(AsyncWebServerRequest *request) {
-  auto *c = parent_->controller();
   JsonDocument doc;
   auto root = doc.to<JsonObject>();
-  root["receiving_data"] = c->receivingData();
-  root["data_last_received_ms"] = c->dataLastReceivedTime;
-  root["data_last_sent_ms"] = c->dataLastSentTime;
-  root["status_last_received_ms"] = c->statusLastReceivedTime;
-  root["pending_commands"] = c->totalPendingCommands();
-  root["pending_main_commands"] = c->totalPendingMainCommands();
+  root["demo"] = parent_->demo_mode();
+  if (parent_->demo_mode()) {
+    root["receiving_data"] = true;
+    root["data_last_received_ms"] = (unsigned long) millis();
+    root["data_last_sent_ms"] = (unsigned long) millis();
+    root["status_last_received_ms"] = (unsigned long) millis();
+    root["pending_commands"] = 0;
+    root["pending_main_commands"] = 0;
+  } else {
+    auto *c = parent_->controller();
+    root["receiving_data"] = c->receivingData();
+    root["data_last_received_ms"] = c->dataLastReceivedTime;
+    root["data_last_sent_ms"] = c->dataLastSentTime;
+    root["status_last_received_ms"] = c->statusLastReceivedTime;
+    root["pending_commands"] = c->totalPendingCommands();
+    root["pending_main_commands"] = c->totalPendingMainCommands();
+  }
   root["uptime_ms"] = (unsigned long) millis();
 
   std::string out;
@@ -427,7 +554,7 @@ void Actron485ApiHandler::handle_power_(AsyncWebServerRequest *request, const st
   JsonDocument doc;
   if (deserializeJson(doc, body)) { send_error_(request, 400, "invalid_json"); return; }
   if (!doc["on"].is<bool>()) { send_error_(request, 400, "missing_on"); return; }
-  parent_->controller()->setSystemOn(doc["on"].as<bool>());
+  parent_->apply_system_on(doc["on"].as<bool>());
   send_json_(request, 202, "{\"status\":\"queued\"}");
 }
 
@@ -437,7 +564,7 @@ void Actron485ApiHandler::handle_mode_(AsyncWebServerRequest *request, const std
   const char *mode = doc["mode"] | (const char *) nullptr;
   Actron485::OperatingMode op;
   if (!string_to_operating_mode(mode, op)) { send_error_(request, 400, "invalid_mode"); return; }
-  parent_->controller()->setOperatingMode(op);
+  parent_->apply_operating_mode(op);
   send_json_(request, 202, "{\"status\":\"queued\"}");
 }
 
@@ -448,10 +575,10 @@ void Actron485ApiHandler::handle_fan_(AsyncWebServerRequest *request, const std:
   if (speed != nullptr) {
     Actron485::FanMode fan;
     if (!string_to_fan_mode(speed, fan)) { send_error_(request, 400, "invalid_speed"); return; }
-    parent_->controller()->setFanSpeed(fan);
+    parent_->apply_fan_speed(fan);
   }
   if (doc["continuous"].is<bool>()) {
-    parent_->controller()->setContinuousFanMode(doc["continuous"].as<bool>());
+    parent_->apply_continuous_fan(doc["continuous"].as<bool>());
   }
   send_json_(request, 202, "{\"status\":\"queued\"}");
 }
@@ -464,7 +591,7 @@ void Actron485ApiHandler::handle_setpoint_(AsyncWebServerRequest *request, const
   }
   double t = doc["temperature"].as<double>();
   if (t < 16.0 || t > 30.0) { send_error_(request, 400, "temperature_out_of_range"); return; }
-  parent_->controller()->setMasterSetpoint(t);
+  parent_->apply_master_setpoint(t);
   send_json_(request, 202, "{\"status\":\"queued\"}");
 }
 
@@ -474,7 +601,7 @@ void Actron485ApiHandler::handle_zone_(AsyncWebServerRequest *request, int zone,
   if (deserializeJson(doc, body)) { send_error_(request, 400, "invalid_json"); return; }
 
   if (doc["on"].is<bool>()) {
-    parent_->controller()->setZoneOn((uint8_t) zone, doc["on"].as<bool>());
+    parent_->apply_zone_on((uint8_t) zone, doc["on"].as<bool>());
   }
   if (doc["setpoint"].is<float>() || doc["setpoint"].is<double>() || doc["setpoint"].is<int>()) {
     if (!parent_->climate()->has_ultima()) {
@@ -482,7 +609,7 @@ void Actron485ApiHandler::handle_zone_(AsyncWebServerRequest *request, int zone,
     }
     double t = doc["setpoint"].as<double>();
     if (t < 16.0 || t > 30.0) { send_error_(request, 400, "setpoint_out_of_range"); return; }
-    parent_->controller()->setZoneSetpointTemperatureCustom((uint8_t) zone, t, false);
+    parent_->apply_zone_setpoint((uint8_t) zone, t);
   }
   send_json_(request, 202, "{\"status\":\"queued\"}");
 }
@@ -497,7 +624,7 @@ void Actron485ApiHandler::handle_zone_control_(AsyncWebServerRequest *request, i
   JsonDocument doc;
   if (deserializeJson(doc, body)) { send_error_(request, 400, "invalid_json"); return; }
   if (!doc["enabled"].is<bool>()) { send_error_(request, 400, "missing_enabled"); return; }
-  parent_->controller()->setControlZone((uint8_t) zone, doc["enabled"].as<bool>());
+  parent_->apply_zone_control((uint8_t) zone, doc["enabled"].as<bool>());
   send_json_(request, 202, "{\"status\":\"queued\"}");
 }
 
@@ -516,10 +643,13 @@ void Actron485ApiHandler::handle_zone_temperature_(AsyncWebServerRequest *reques
   // Wide bounds — not the AC's setpoint range; just sanity-checking the
   // reading is plausibly room temperature in Celsius.
   if (t < 0.0 || t > 60.0) { send_error_(request, 400, "temperature_out_of_range"); return; }
-  if (!parent_->controller()->getControlZone((uint8_t) zone)) {
+  bool controlled = parent_->demo_mode()
+                       ? false  // demo: just accept the reading
+                       : parent_->controller()->getControlZone((uint8_t) zone);
+  if (!parent_->demo_mode() && !controlled) {
     ESP_LOGW(TAG, "Zone %d temperature set while not in control; call /control first", zone);
   }
-  parent_->controller()->setZoneCurrentTemperature((uint8_t) zone, t);
+  parent_->apply_zone_current_temperature((uint8_t) zone, t);
   parent_->note_zone_temperature_update((uint8_t) zone);
   send_json_(request, 202, "{\"status\":\"queued\"}");
 }
