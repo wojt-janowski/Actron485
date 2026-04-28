@@ -550,15 +550,24 @@ namespace Actron485 {
             bytesRead++;
             _serialBufferReceivedTime = platformMillis();
 
-            if (_serialBufferIndex == 1) {
-                MessageType messageType = detectActronMessageType(_serialBuffer[0]);
-                _serialBufferExpectedLength = expectedActronMessageLength(messageType);
+            MessageType firstByteType = MessageType::Unknown;
+            if (_serialBufferIndex >= 1) {
+                firstByteType = detectActronMessageType(_serialBuffer[0]);
             }
 
-            uint8_t modbusLength = expectedModbusMessageLength();
-            if (modbusLength > 0 && (_serialBufferExpectedLength == 0 || modbusLength > _serialBufferExpectedLength)) {
-                // Allow variable-length Modbus responses (0x03/0x04/0x10) to grow once byte_count arrives.
-                _serialBufferExpectedLength = modbusLength;
+            if (_serialBufferIndex == 1) {
+                _serialBufferExpectedLength = expectedActronMessageLength(firstByteType);
+            }
+
+            // Only fall through to Modbus framing if the first byte didn't already match a known
+            // Actron message type. Several Actron types (notably IndoorBoard1 = 0x01) collide with
+            // valid Modbus slave addresses, and their second byte can match a Modbus function code,
+            // which would otherwise cause Modbus framing to chop the Actron frame in half.
+            if (firstByteType == MessageType::Unknown) {
+                uint8_t modbusLength = expectedModbusMessageLength();
+                if (modbusLength > 0 && (_serialBufferExpectedLength == 0 || modbusLength > _serialBufferExpectedLength)) {
+                    _serialBufferExpectedLength = modbusLength;
+                }
             }
 
             if (_serialBufferExpectedLength > 0 && _serialBufferIndex >= _serialBufferExpectedLength) {
