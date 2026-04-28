@@ -360,14 +360,126 @@ namespace Actron485 {
             return;
         }
 
-        if (!isModbusMessage()) {
-            processMessage(_serialBuffer, _serialBufferIndex);
-        } else if (printOut && (printOutMode == PrintOutMode::AllMessages || printOutMode == PrintOutMode::CorrelationCapture)) {
-            printModbusMessage();
+        // 2020+ Que masters speak pure Modbus RTU. Validated frames go to the
+        // register decoder; everything else is dropped. The legacy custom-byte
+        // protocol path (processMessage) is intentionally not invoked here:
+        // its handlers produce coincidental garbage decodes when fed misframed
+        // bytes from a Modbus stream.
+        if (isModbusMessage()) {
+            processModbusFrame(_serialBuffer, _serialBufferIndex);
+            if (printOut && (printOutMode == PrintOutMode::AllMessages || printOutMode == PrintOutMode::CorrelationCapture)) {
+                printModbusMessage();
+            }
         }
 
         _serialBufferIndex = 0;
         _serialBufferExpectedLength = 0;
+    }
+
+    void Controller::processModbusFrame(const uint8_t *frame, uint8_t length) {
+        if (length < 4) {
+            return;
+        }
+        uint8_t slave = frame[0];
+        uint8_t function = frame[1];
+
+        unsigned long now = platformMillis();
+        dataLastReceivedTime = now;
+
+        // Function 0x10: Write Multiple Registers Request
+        // Layout: [slave][0x10][addrHi][addrLo][cntHi][cntLo][byteCount][data...][crcLo][crcHi]
+        if (function == 0x10 && length >= 9) {
+            uint16_t startAddr = (uint16_t(frame[2]) << 8) | frame[3];
+            uint16_t regCount = (uint16_t(frame[4]) << 8) | frame[5];
+            uint8_t byteCount = frame[6];
+            if (length < uint8_t(9 + byteCount)) {
+                return;
+            }
+            const uint8_t *data = frame + 7;
+
+            if (slave == 11) {
+                applySlave11StateBroadcast(startAddr, regCount, data, byteCount);
+            }
+            return;
+        }
+
+        // Function 0x03: Read Holding Registers
+        if (function == 0x03) {
+            // Request: 8 bytes total
+            if (length == 8) {
+                _modbusLastReadSlave = slave;
+                _modbusLastReadFunction = function;
+                _modbusLastReadStartAddress = (uint16_t(frame[2]) << 8) | frame[3];
+                _modbusLastReadCount = (uint16_t(frame[4]) << 8) | frame[5];
+                _modbusLastReadTimestamp = now;
+                return;
+            }
+            // Response: [slave][0x03][byteCount][data...][crcLo][crcHi]
+            // Phase 2 will use these for slave 1 outdoor/refrigerant floats and
+            // slave 3 zone temp readbacks. Phase 1 relies on slave 11 writes.
+            return;
+        }
+    }
+
+    void Controller::applySlave11StateBroadcast(uint16_t startAddress, uint16_t regCount, const uint8_t *data, uint8_t byteCount) {
+        // The master writes a 10-register status block to slave 11 every ~2s.
+        // Layout (validated against a 2020 Que running setpoint=22.0/23.0/24.5):
+        //   reg 2  : status word — high byte 0x02 when system active, 0x00 off
+        //   reg 3  : mode flags — high byte 0x82 = Cool active, 0x00 = system off
+        //   reg 4-7: setpoint marker — every byte is (setpoint × 2)
+        //   reg 8-11: 8 zone temps packed 2 per register, each byte is signed
+        //            int8 tenths of °C offset from the master setpoint
+        //
+        // Dud zones (no installed sensor) reflect the master controller's own
+        // indoor reading, so we use one of those bytes as master indoor temp
+        // until Phase 2 finds a dedicated register.
+        if (startAddress != 2 || regCount < 10 || byteCount < 20) {
+            return;
+        }
+
+        // Setpoint: high byte of reg 4 (data[4]) = setpoint × 2
+        uint8_t setpointMarker = data[4];
+        if (setpointMarker == 0) {
+            // Defensive: 0 marker is meaningless, skip rather than report 0°C
+            return;
+        }
+        double setpoint = double(setpointMarker) / 2.0;
+        stateMessage2.setpoint = setpoint;
+
+        // Mode flags from reg 3 high byte (data[2]).
+        // Confirmed mappings from probing: 0x00 = OFF, 0x82 = Cool active.
+        // Heat/Fan/Auto bit layout to be confirmed in Phase 2; until then we
+        // fall back to OperatingMode::Off when the bit pattern is unknown.
+        uint8_t modeFlags = data[2];
+        switch (modeFlags) {
+            case 0x00:
+                stateMessage2.operatingMode = OperatingMode::Off;
+                stateMessage2.compressorMode = CompressorMode::Idle;
+                break;
+            case 0x82:
+                stateMessage2.operatingMode = OperatingMode::Cool;
+                stateMessage2.compressorMode = CompressorMode::Cooling;
+                break;
+            default:
+                // Unknown mode flag — leave previous value in place rather
+                // than spuriously flipping the UI to "off".
+                break;
+        }
+
+        // 8 zone temps packed 2 per register starting at reg 8 (data[12..19]).
+        for (int z = 0; z < 8; z++) {
+            int8_t offset = (int8_t)data[12 + z];
+            zoneTemperature[z] = setpoint + (double(offset) * 0.1);
+        }
+
+        // Master indoor proxy: zone-3 byte (data[14]) reflects the master
+        // controller reading on this install (zone 3 has no sensor). When
+        // Phase 2 identifies a dedicated indoor-temp register, swap to that.
+        int8_t masterOffset = (int8_t)data[14];
+        stateMessage2.temperature = setpoint + (double(masterOffset) * 0.1);
+
+        stateMessage2.initialised = true;
+        statusLastReceivedTime = platformMillis();
     }
 
     uint8_t Controller::expectedActronMessageLength(MessageType messageType) {
@@ -581,15 +693,27 @@ namespace Actron485 {
     }
 
     void Controller::attemptToSendQueuedCommand() {
+        // Phase 1: read-only. The legacy custom-byte command frames produced
+        // by sendQueuedCommand() are not compatible with the Modbus RTU bus on
+        // 2020+ Que masters and would cause CRC garbage if injected. Phase 3
+        // will replace this with quiet-window Modbus Write Multiple Registers
+        // frames once Phase 2 has identified the writable command registers.
         unsigned long now = platformMillis();
-        // Rate limit us sending 1 message every 2 seconds
         if ((now - dataLastSentTime) > 1999) {
-            // Reset board comms1 counter
             boardComms1Index = 0;
             if (printOut && (printOutMode == PrintOutMode::AllMessages || printOutMode == PrintOutMode::CorrelationCapture)) {
                 printOut->println("Time to Send");
             }
-            sendQueuedCommand();
+            // Drain command queue without transmitting so callers don't see
+            // perpetually-pending commands. Real injection arrives in Phase 3.
+            sendOperatingModeCommand = false;
+            sendZoneStateCommand = false;
+            sendSetpointCommand = false;
+            sendFanModeCommand = false;
+            sendZoneSetpointCustomCommand = false;
+            for (int z = 0; z < 8; z++) {
+                sendMasterToZoneMessage[z] = false;
+            }
         }
     }
 

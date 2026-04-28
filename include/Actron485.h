@@ -97,6 +97,14 @@ class Controller {
     uint16_t checksumModbus(const uint8_t *data, uint8_t length);
     /// @brief Checks if current buffer is a valid Modbus RTU frame
     bool isModbusMessage();
+
+    /// @brief Decode a validated Modbus RTU frame and update state.
+    /// On a 2020+ Que master the bus speaks pure Modbus RTU rather than the
+    /// custom byte protocol that this library was originally written for.
+    void processModbusFrame(const uint8_t *frame, uint8_t length);
+    /// @brief Map a Write Multiple Registers payload sent to slave 11 into stateMessage2.
+    /// Slave 11 receives the master's full state broadcast every ~2 seconds.
+    void applySlave11StateBroadcast(uint16_t startAddress, uint16_t regCount, const uint8_t *data, uint8_t byteCount);
     /// @brief Prints a decoded Modbus RTU summary for current serial buffer
     void printModbusMessage();
     /// @brief Prints a compact Actron state snapshot used in capture mode
