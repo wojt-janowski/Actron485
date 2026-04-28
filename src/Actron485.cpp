@@ -472,11 +472,19 @@ namespace Actron485 {
             zoneTemperature[z] = setpoint + (double(offset) * 0.1);
         }
 
-        // Master indoor proxy: zone-3 byte (data[14]) reflects the master
-        // controller reading on this install (zone 3 has no sensor). When
-        // Phase 2 identifies a dedicated indoor-temp register, swap to that.
-        int8_t masterOffset = (int8_t)data[14];
-        stateMessage2.temperature = setpoint + (double(masterOffset) * 0.1);
+        // Master indoor temp: the wall controller computes its own "Indoor"
+        // reading separately from any zone — likely a thermistor mounted on
+        // the wall controller itself. We haven't located its dedicated
+        // register yet (Phase 2 work). As a stop-gap for Phase 1 we return
+        // the mean of all 8 zone temps; on this rig that empirically lands
+        // within ~0.1°C of the wall LCD when no zones are anomalous, but
+        // unsensored ("dud") zones report indeterminate values so this
+        // approximation will drift if the duds drift.
+        double zoneSum = 0.0;
+        for (int z = 0; z < 8; z++) {
+            zoneSum += zoneTemperature[z];
+        }
+        stateMessage2.temperature = zoneSum / 8.0;
 
         stateMessage2.initialised = true;
         statusLastReceivedTime = platformMillis();
