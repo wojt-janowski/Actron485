@@ -1,5 +1,7 @@
 #include "Actron485.h"
 #include "Utilities.h"
+#include <cmath>
+#include <cstring>
 
 namespace Actron485 {
  
@@ -222,6 +224,8 @@ namespace Actron485 {
         printOutMode = PrintOutMode::ChangedMessages;
 
         dataLastReceivedTime = 99999;
+        outdoorTemperature = NAN;
+        outdoorTemperatureTimestamp = 0;
 
         // Set to ignore
         for (int i=0; i<8; i++) {
@@ -415,10 +419,53 @@ namespace Actron485 {
                 return;
             }
             // Response: [slave][0x03][byteCount][data...][crcLo][crcHi]
-            // Phase 2 will use these for slave 1 outdoor/refrigerant floats and
-            // slave 3 zone temp readbacks. Phase 1 relies on slave 11 writes.
+            // Match the response back to the most recent request from the same
+            // slave so we know which addresses the payload covers.
+            if (length < 5 || (now - _modbusLastReadTimestamp) > 5000 ||
+                _modbusLastReadSlave != slave || _modbusLastReadFunction != 0x03) {
+                return;
+            }
+            uint8_t byteCount = frame[2];
+            if ((byteCount & 1) || length < uint8_t(byteCount + 5)) {
+                return;
+            }
+            uint16_t startAddr = _modbusLastReadStartAddress;
+            uint16_t regCount = byteCount / 2;
+            const uint8_t *data = frame + 3;
+
+            if (slave == 1) {
+                applySlave1ReadResponse(startAddr, regCount, data);
+            }
             return;
         }
+    }
+
+    void Controller::applySlave1ReadResponse(uint16_t startAddress, uint16_t regCount, const uint8_t *data) {
+        // Slave 1 (AC head) returns a 9-float block at reg 120 in response to a
+        // count=18 read. Float index 5 (regs 130/131) is the outdoor temperature
+        // sensor — confirmed against the wall LCD's "Outdoor" reading (~18.7°C).
+        // Encoding is big-endian IEEE-754 with the high half-word first (ABCD).
+        const uint16_t outdoorRegHigh = 130;
+        const uint16_t outdoorRegLow = 131;
+        if (startAddress > outdoorRegHigh || startAddress + regCount <= outdoorRegLow) {
+            return;
+        }
+
+        uint16_t offsetHigh = (outdoorRegHigh - startAddress) * 2;
+        uint16_t regA = (uint16_t(data[offsetHigh]) << 8) | data[offsetHigh + 1];
+        uint16_t regB = (uint16_t(data[offsetHigh + 2]) << 8) | data[offsetHigh + 3];
+        uint32_t raw = (uint32_t(regA) << 16) | regB;
+        float value;
+        memcpy(&value, &raw, sizeof(value));
+        if (!std::isfinite(value) || value < -60.0f || value > 80.0f) {
+            return;
+        }
+        outdoorTemperature = double(value);
+        outdoorTemperatureTimestamp = platformMillis();
+    }
+
+    double Controller::getOutdoorTemperature() {
+        return outdoorTemperature;
     }
 
     void Controller::applySlave11StateBroadcast(uint16_t startAddress, uint16_t regCount, const uint8_t *data, uint8_t byteCount) {

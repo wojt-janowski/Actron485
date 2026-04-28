@@ -105,6 +105,9 @@ class Controller {
     /// @brief Map a Write Multiple Registers payload sent to slave 11 into stateMessage2.
     /// Slave 11 receives the master's full state broadcast every ~2 seconds.
     void applySlave11StateBroadcast(uint16_t startAddress, uint16_t regCount, const uint8_t *data, uint8_t byteCount);
+    /// @brief Map a Read Holding Registers response from slave 1 (AC head) into derived state.
+    /// Currently extracts the outdoor temperature float at reg 130/131 when the read range covers it.
+    void applySlave1ReadResponse(uint16_t startAddress, uint16_t regCount, const uint8_t *data);
     /// @brief Prints a decoded Modbus RTU summary for current serial buffer
     void printModbusMessage();
     /// @brief Prints a compact Actron state snapshot used in capture mode
@@ -169,6 +172,12 @@ public:
     unsigned long dataLastSentTime;
     /// @brief system millis when the last status message arrived (useful for comparing against a command sent time for updates)
     unsigned long statusLastReceivedTime;
+
+    /// @brief Outdoor temperature in °C, decoded from slave 1 reg 130/131 (big-endian IEEE-754 float).
+    /// NaN until the first valid Function 0x03 read response covering that pair has been parsed.
+    double outdoorTemperature;
+    /// @brief system millis when outdoorTemperature was last refreshed (0 if never).
+    unsigned long outdoorTemperatureTimestamp = 0;
 
     /// @brief Message type determined by the first byte
     /// @param firstByte to from the message
@@ -324,6 +333,10 @@ public:
     /// and operating zones
     /// @returns temperature in °C
     double getMasterCurrentTemperature();
+
+    /// @brief get the outdoor temperature reported by the AC head (slave 1 reg 130/131).
+    /// @returns temperature in °C, or NaN if the pair has not been read yet.
+    double getOutdoorTemperature();
 
     /// @brief if the compressor is idle, or active
     /// @return state of compressor

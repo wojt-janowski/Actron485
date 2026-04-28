@@ -444,6 +444,10 @@ std::string Actron485Api::build_state_json() {
     root["compressor"] = compressor_to_string(c->getCompressorMode());
     root["setpoint"] = c->getMasterSetpoint();
     root["current_temperature"] = c->getMasterCurrentTemperature();
+    double outdoor = c->getOutdoorTemperature();
+    if (std::isfinite(outdoor)) {
+      root["outdoor_temperature"] = outdoor;
+    }
     root["has_ultima"] = climate_->has_ultima();
 
     JsonArray zones = root["zones"].to<JsonArray>();
