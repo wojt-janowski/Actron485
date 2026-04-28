@@ -487,29 +487,30 @@ namespace Actron485 {
         }
 
         // Decode mode flag from reg 3 high byte (data[2]).
-        // Bits seen so far: bit 7 = "system on", bit 1 = "compressor active".
-        // Confirmed mappings from probing this rig:
-        //   0x00 = Off
-        //   0x80 = Auto, compressor idle (system on, awaiting demand)
-        //   0x82 = Cool, compressor cooling
-        // Heat/FanOnly/standby variants TBD — leave prior value untouched
-        // for unknown patterns rather than flipping the UI to "off".
+        // Slave 11 reg 3 high byte alone does NOT encode the operating mode —
+        // it's the same 0x80 in Cool / Heat / Fan-only when the system is on
+        // and the compressor is idle. Operating mode appears to be carried
+        // elsewhere (candidate registers: reg 2 high byte and reg 3 low byte
+        // both flip when the user changes Cool↔Heat/Fan — see PROTOCOL_NOTES).
+        // For now we only decode the bits we know:
+        //   bit 7 = system on
+        //   bit 1 = compressor active
+        // and leave OperatingMode untouched when bit 7 is set, so the UI
+        // doesn't pin to a specific mode we can't yet identify.
         uint8_t modeFlags = data[2];
-        switch (modeFlags) {
-            case 0x00:
-                stateMessage2.operatingMode = OperatingMode::Off;
-                stateMessage2.compressorMode = CompressorMode::Idle;
-                break;
-            case 0x80:
-                stateMessage2.operatingMode = OperatingMode::Auto;
-                stateMessage2.compressorMode = CompressorMode::Idle;
-                break;
-            case 0x82:
-                stateMessage2.operatingMode = OperatingMode::Cool;
-                stateMessage2.compressorMode = CompressorMode::Cooling;
-                break;
-            default:
-                break;
+        if (modeFlags == 0x00) {
+            stateMessage2.operatingMode = OperatingMode::Off;
+            stateMessage2.compressorMode = CompressorMode::Idle;
+        } else if (modeFlags & 0x80) {
+            // Without a confirmed operating-mode register yet, default to Cool
+            // when bit 7 is set. On this rig the system is always in Cool, so
+            // this is correct in practice — Phase 2 task #3 will replace this
+            // with a real decode based on reg 2 high byte / reg 3 low byte
+            // (both flip when the user changes Cool↔Heat/Fan, see PROTOCOL_NOTES).
+            stateMessage2.operatingMode = OperatingMode::Cool;
+            stateMessage2.compressorMode = (modeFlags & 0x02)
+                ? CompressorMode::Cooling
+                : CompressorMode::Idle;
         }
 
         // 8 per-zone setpoints (regs 4-7, bytes data[4..11]).
