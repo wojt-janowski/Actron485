@@ -469,38 +469,39 @@ namespace Actron485 {
     }
 
     void Controller::applySlave11StateBroadcast(uint16_t startAddress, uint16_t regCount, const uint8_t *data, uint8_t byteCount) {
-        // The master writes a 10-register status block to slave 11 every ~2s.
-        // Layout (validated against a 2020 Que running setpoint=22.0/23.0/24.5):
+        // The master writes a 10-register status block to slave 11 every ~2-15s.
+        // Layout (validated against a 2020 Que with mixed per-zone setpoints):
         //   reg 2  : status word — high byte 0x02 when system active, 0x00 off
-        //   reg 3  : mode flags — high byte 0x82 = Cool active, 0x00 = system off
-        //   reg 4-7: setpoint marker — every byte is (setpoint × 2)
-        //   reg 8-11: 8 zone temps packed 2 per register, each byte is signed
-        //            int8 tenths of °C offset from the master setpoint
-        //
-        // Dud zones (no installed sensor) reflect the master controller's own
-        // indoor reading, so we use one of those bytes as master indoor temp
-        // until Phase 2 finds a dedicated register.
+        //   reg 3  : mode flags — high byte (see decode table below).
+        //   reg 4-7  : 8 per-zone setpoints packed 2 per register,
+        //              each byte = (zone_setpoint × 2). Phase 1 mistook these
+        //              for "master setpoint markers" because all zones in the
+        //              probe sample shared the same setpoint; with mixed
+        //              setpoints the bytes diverge — see Phase 2 capture in
+        //              PROTOCOL_NOTES.md.
+        //   reg 8-11 : 8 zone temp offsets packed 2 per register, each byte
+        //              is signed int8 tenths of °C offset from THAT zone's
+        //              setpoint (not from the master setpoint).
         if (startAddress != 2 || regCount < 10 || byteCount < 20) {
             return;
         }
 
-        // Setpoint: high byte of reg 4 (data[4]) = setpoint × 2
-        uint8_t setpointMarker = data[4];
-        if (setpointMarker == 0) {
-            // Defensive: 0 marker is meaningless, skip rather than report 0°C
-            return;
-        }
-        double setpoint = double(setpointMarker) / 2.0;
-        stateMessage2.setpoint = setpoint;
-
-        // Mode flags from reg 3 high byte (data[2]).
-        // Confirmed mappings from probing: 0x00 = OFF, 0x82 = Cool active.
-        // Heat/Fan/Auto bit layout to be confirmed in Phase 2; until then we
-        // fall back to OperatingMode::Off when the bit pattern is unknown.
+        // Decode mode flag from reg 3 high byte (data[2]).
+        // Bits seen so far: bit 7 = "system on", bit 1 = "compressor active".
+        // Confirmed mappings from probing this rig:
+        //   0x00 = Off
+        //   0x80 = Auto, compressor idle (system on, awaiting demand)
+        //   0x82 = Cool, compressor cooling
+        // Heat/FanOnly/standby variants TBD — leave prior value untouched
+        // for unknown patterns rather than flipping the UI to "off".
         uint8_t modeFlags = data[2];
         switch (modeFlags) {
             case 0x00:
                 stateMessage2.operatingMode = OperatingMode::Off;
+                stateMessage2.compressorMode = CompressorMode::Idle;
+                break;
+            case 0x80:
+                stateMessage2.operatingMode = OperatingMode::Auto;
                 stateMessage2.compressorMode = CompressorMode::Idle;
                 break;
             case 0x82:
@@ -508,25 +509,47 @@ namespace Actron485 {
                 stateMessage2.compressorMode = CompressorMode::Cooling;
                 break;
             default:
-                // Unknown mode flag — leave previous value in place rather
-                // than spuriously flipping the UI to "off".
                 break;
         }
 
-        // 8 zone temps packed 2 per register starting at reg 8 (data[12..19]).
+        // 8 per-zone setpoints (regs 4-7, bytes data[4..11]).
+        // Defensive: a 0 byte means "no value" — skip rather than report 0°C.
+        bool anyValid = false;
+        double firstValidSetpoint = 0.0;
         for (int z = 0; z < 8; z++) {
-            int8_t offset = (int8_t)data[12 + z];
-            zoneTemperature[z] = setpoint + (double(offset) * 0.1);
+            uint8_t b = data[4 + z];
+            if (b == 0) {
+                continue;
+            }
+            zoneSetpoint[z] = double(b) / 2.0;
+            if (!anyValid) {
+                firstValidSetpoint = zoneSetpoint[z];
+                anyValid = true;
+            }
+        }
+        if (!anyValid) {
+            return;
         }
 
-        // Master indoor temp: the wall controller computes its own "Indoor"
-        // reading separately from any zone — likely a thermistor mounted on
-        // the wall controller itself. We haven't located its dedicated
-        // register yet (Phase 2 work). As a stop-gap for Phase 1 we return
-        // the mean of all 8 zone temps; on this rig that empirically lands
-        // within ~0.1°C of the wall LCD when no zones are anomalous, but
-        // unsensored ("dud") zones report indeterminate values so this
-        // approximation will drift if the duds drift.
+        // 8 zone temp offsets (regs 8-11, bytes data[12..19]) — signed int8
+        // tenths of °C, RELATIVE TO THAT ZONE'S OWN SETPOINT.
+        for (int z = 0; z < 8; z++) {
+            int8_t offset = (int8_t) data[12 + z];
+            zoneTemperature[z] = zoneSetpoint[z] + (double(offset) * 0.1);
+        }
+
+        // Master setpoint surrogate: the master setpoint shown on the wall
+        // LCD doesn't have a confirmed register here yet. Zone 1's setpoint
+        // is a workable proxy on this rig because the wall controller anchors
+        // the master to the control zone, which is typically zone 1. Phase 2
+        // task #7 will revisit once the real register is found.
+        stateMessage2.setpoint = firstValidSetpoint;
+
+        // Master indoor temp stop-gap remains the mean of all 8 zone temps
+        // until Phase 2 task #2 locates the wall-controller thermistor
+        // register. With per-zone setpoints now decoded correctly the mean
+        // drifts a bit further from the LCD than under Phase 1's all-equal
+        // assumption, but it's still usable for graceful degradation.
         double zoneSum = 0.0;
         for (int z = 0; z < 8; z++) {
             zoneSum += zoneTemperature[z];
@@ -1337,10 +1360,13 @@ namespace Actron485 {
     }
 
     double Controller::getZoneSetpointTemperature(uint8_t zone) {
-        // Phase 2: locate per-zone setpoint registers. Until then, every zone
-        // tracks the master setpoint, which is what the wall controller does
-        // by default for non-Ultima zones anyway.
-        return getMasterSetpoint();
+        // Phase 2: per-zone setpoints decoded from slave 11 reg 4-7 (one
+        // byte per zone, byte = setpoint × 2). zoneSetpoint[] is populated
+        // in applySlave11StateBroadcast.
+        if (zone >= 1 && zone <= 8) {
+            return zoneSetpoint[zindex(zone)];
+        }
+        return 0;
     }
 
     void Controller::setZoneCurrentTemperature(uint8_t zone, double temperature) {
