@@ -12,6 +12,12 @@ enum class PrintOutMode: uint8_t {
     ChangedMessages,
     AllMessages,
     CorrelationCapture,
+    /// Print only register VALUE CHANGES on the bus, one terse line per change.
+    /// Suppresses the firehose of per-frame register dumps. First time a
+    /// (slave, address) is seen it logs `[init]`; subsequent unchanged values
+    /// are silent. Designed for probing unknown registers — toggle a setting
+    /// on the wall controller, see exactly which register flipped.
+    RegisterDelta,
 };
 
 // Message Type

@@ -43,6 +43,19 @@ class Controller {
     uint16_t _modbusLastReadCount = 0;
     unsigned long _modbusLastReadTimestamp = 0;
 
+    /// @brief Per-(slave, address) value cache for PrintOutMode::RegisterDelta.
+    /// We've seen ~50 distinct (slave, addr) pairs on this bus; 256 slots is
+    /// generous but cheap (~2 KB).
+    struct RegisterCacheEntry {
+        uint8_t slave;
+        uint16_t address;
+        uint16_t value;
+        unsigned long lastSeenMs;
+    };
+    static const size_t _registerCacheCapacity = 256;
+    RegisterCacheEntry _registerCache[_registerCacheCapacity] = {};
+    size_t _registerCacheCount = 0;
+
     /// Keeps track of if a response occurs after a set zone command is sent, so we know if we can discard our snapshot of the zone state
     bool _sendZoneStateCommandCleared = true;
 
@@ -108,8 +121,25 @@ class Controller {
     /// @brief Map a Read Holding Registers response from slave 1 (AC head) into derived state.
     /// Currently extracts the outdoor temperature float at reg 130/131 when the read range covers it.
     void applySlave1ReadResponse(uint16_t startAddress, uint16_t regCount, const uint8_t *data);
+    /// @brief Map a Read Holding Registers response from slave 3 (the wall
+    /// controller's polling target) into derived state. Used for the
+    /// authoritative operating-mode and compressor decode — slave 11
+    /// broadcasts can lag the compressor transitions.
+    void applySlave3ReadResponse(uint16_t startAddress, uint16_t regCount, const uint8_t *data);
     /// @brief Prints a decoded Modbus RTU summary for current serial buffer
     void printModbusMessage();
+    /// @brief In RegisterDelta mode, look up and update the cached value for
+    /// (slave, address). Outputs whether the slot was previously seen and the
+    /// previous value/timestamp; the new value is stored before returning.
+    struct RegisterCacheLookup {
+        bool seen;
+        uint16_t oldValue;
+        unsigned long oldMs;
+    };
+    RegisterCacheLookup updateRegisterCache(uint8_t slave, uint16_t address, uint16_t value);
+    /// @brief Print one delta line for a register that has changed value
+    /// (or a `[init]` line if never seen before).
+    void printRegisterDelta(uint8_t slave, uint16_t address, uint16_t value);
     /// @brief Prints a compact Actron state snapshot used in capture mode
     void printCaptureStateSnapshot(uint8_t *data, uint8_t length, const char *sourceTag);
     /// @brief Prints a compact parsed zone wall message used in capture mode

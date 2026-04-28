@@ -127,8 +127,142 @@ void Controller::printCaptureZoneMasterMessage(uint8_t zone, uint8_t *data, uint
     printOut->println();
 }
 
+Controller::RegisterCacheLookup Controller::updateRegisterCache(uint8_t slave, uint16_t address, uint16_t value) {
+    RegisterCacheLookup result{false, 0, 0};
+    unsigned long now = platformMillis();
+    for (size_t i = 0; i < _registerCacheCount; i++) {
+        auto &slot = _registerCache[i];
+        if (slot.slave == slave && slot.address == address) {
+            result.seen = true;
+            result.oldValue = slot.value;
+            result.oldMs = slot.lastSeenMs;
+            slot.value = value;
+            slot.lastSeenMs = now;
+            return result;
+        }
+    }
+    if (_registerCacheCount < _registerCacheCapacity) {
+        auto &slot = _registerCache[_registerCacheCount++];
+        slot.slave = slave;
+        slot.address = address;
+        slot.value = value;
+        slot.lastSeenMs = now;
+    }
+    // If the cache is full (very unlikely) we just don't track any new
+    // addresses — old slots keep delta-checking for the registers we already
+    // know about.
+    return result;
+}
+
+void Controller::printRegisterDelta(uint8_t slave, uint16_t address, uint16_t value) {
+    if (!printOut) {
+        return;
+    }
+    auto lookup = updateRegisterCache(slave, address, value);
+    if (lookup.seen && lookup.oldValue == value) {
+        return;
+    }
+    printOut->print("Δ s");
+    printOut->print(slave);
+    printOut->print(" ");
+    printHex16(printOut, address);
+    printOut->print(": ");
+    if (lookup.seen) {
+        printHex16(printOut, lookup.oldValue);
+        printOut->print(" → ");
+        printHex16(printOut, value);
+        unsigned long ageMs = platformMillis() - lookup.oldMs;
+        printOut->print("  (held ");
+        printOut->print(ageMs / 1000.0, 1);
+        printOut->print("s)");
+    } else {
+        printOut->print("[init] ");
+        printHex16(printOut, value);
+    }
+    printOut->println();
+}
+
+namespace {
+
+// Delta-mode-only frame walker. Knows how to extract (address, value)
+// pairs from validated Modbus RTU frames; calls back the controller's
+// printRegisterDelta for each register. Doesn't print frame headers,
+// raw byte dumps, or float interpretations — those are noise in delta
+// mode. Read responses without a recent matching request are silently
+// dropped because we can't know their address range.
+void emitDeltasFromFrame(Controller *controller,
+                         const uint8_t *frame, uint8_t length,
+                         uint8_t modbusLastReadSlave,
+                         uint8_t modbusLastReadFunction,
+                         uint16_t modbusLastReadStartAddress,
+                         unsigned long modbusLastReadTimestamp,
+                         unsigned long now) {
+    if (length < 4) {
+        return;
+    }
+    uint8_t slave = frame[0];
+    uint8_t function = frame[1];
+    if ((function & 0x80) != 0) {
+        return;
+    }
+
+    // Function 0x10 = Write Multiple Registers Request.
+    // Layout: [slave][0x10][addrHi][addrLo][cntHi][cntLo][byteCount][data...][crcLo][crcHi]
+    if (function == 0x10 && length >= 9) {
+        uint16_t startAddr = (uint16_t(frame[2]) << 8) | frame[3];
+        uint8_t byteCount = frame[6];
+        if (byteCount & 1) {
+            return;
+        }
+        if (length < uint8_t(9 + byteCount)) {
+            return;
+        }
+        uint16_t regCount = byteCount / 2;
+        for (uint16_t i = 0; i < regCount; i++) {
+            uint16_t value = (uint16_t(frame[7 + i * 2]) << 8) | frame[7 + i * 2 + 1];
+            controller->printRegisterDelta(slave, startAddr + i, value);
+        }
+        return;
+    }
+
+    // Function 0x03 = Read Holding Registers.
+    if (function == 0x03) {
+        // Skip the 8-byte request frame — that's just (start, count) and
+        // doesn't carry register values. The matching response is what we
+        // want.
+        if (length == 8) {
+            return;
+        }
+        // Response: [slave][0x03][byteCount][data...][crcLo][crcHi]
+        if (length < 5 || (now - modbusLastReadTimestamp) > 5000 ||
+            modbusLastReadSlave != slave || modbusLastReadFunction != 0x03) {
+            return;
+        }
+        uint8_t byteCount = frame[2];
+        if ((byteCount & 1) || length < uint8_t(byteCount + 5)) {
+            return;
+        }
+        uint16_t regCount = byteCount / 2;
+        for (uint16_t i = 0; i < regCount; i++) {
+            uint16_t value = (uint16_t(frame[3 + i * 2]) << 8) | frame[3 + i * 2 + 1];
+            controller->printRegisterDelta(slave, modbusLastReadStartAddress + i, value);
+        }
+        return;
+    }
+}
+
+}  // namespace
+
 void Controller::printModbusMessage() {
     if (!printOut || _serialBufferIndex < 4) {
+        return;
+    }
+
+    if (printOutMode == PrintOutMode::RegisterDelta) {
+        emitDeltasFromFrame(this, _serialBuffer, _serialBufferIndex,
+                            _modbusLastReadSlave, _modbusLastReadFunction,
+                            _modbusLastReadStartAddress, _modbusLastReadTimestamp,
+                            platformMillis());
         return;
     }
 

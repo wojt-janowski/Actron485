@@ -77,6 +77,9 @@ void Actron485Climate::setup() {
             case 4:
                 actron_controller.printOutMode = Actron485::PrintOutMode::CorrelationCapture;
                 break;
+            case 5:
+                actron_controller.printOutMode = Actron485::PrintOutMode::RegisterDelta;
+                break;
         }
     }
 

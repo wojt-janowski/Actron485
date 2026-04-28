@@ -34,6 +34,7 @@ ALLOWED_LOGGING_MODES = {
     "CHANGE": 2,
     "ALL": 3,
     "CAPTURE": 4,
+    "DELTA": 5,
 }
 
 ultima_config_parameter = {

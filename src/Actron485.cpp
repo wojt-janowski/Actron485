@@ -371,7 +371,9 @@ namespace Actron485 {
         // bytes from a Modbus stream.
         if (isModbusMessage()) {
             processModbusFrame(_serialBuffer, _serialBufferIndex);
-            if (printOut && (printOutMode == PrintOutMode::AllMessages || printOutMode == PrintOutMode::CorrelationCapture)) {
+            if (printOut && (printOutMode == PrintOutMode::AllMessages
+                           || printOutMode == PrintOutMode::CorrelationCapture
+                           || printOutMode == PrintOutMode::RegisterDelta)) {
                 printModbusMessage();
             }
         }
@@ -435,9 +437,63 @@ namespace Actron485 {
 
             if (slave == 1) {
                 applySlave1ReadResponse(startAddr, regCount, data);
+            } else if (slave == 3) {
+                applySlave3ReadResponse(startAddr, regCount, data);
             }
             return;
         }
+    }
+
+    void Controller::applySlave3ReadResponse(uint16_t startAddress, uint16_t regCount, const uint8_t *data) {
+        // Slave 3 read at start=2 count=11 carries the AC head's authoritative
+        // operating-mode + compressor state. Slave 11's broadcast lags behind
+        // for compressor-active transitions (it stays at 0x80 even when the
+        // compressor is cooling), so prefer slave 3 here when available.
+        //
+        // Reg 2 high byte:
+        //   0x02 = Cool/Auto, compressor idle
+        //   0x42 (bits 1+6) = Cool, compressor cooling   (also seen 0x47/0x4A —
+        //                     the low nibble seems to be a small counter)
+        //   0x01 = Heat, compressor idle
+        //   0x01 + low byte 0x64 = Heat, compressor heating
+        //   0x08 = Fan only
+        //
+        // Reg 2 low byte:
+        //   0x00 = Cool        (when reg 2 hi == 0x02)
+        //   0x23 = Auto        (when reg 2 hi == 0x02)
+        //   ... low-nibble counters when actively cooling (0x42-0x4A range)
+        if (startAddress > 2 || startAddress + regCount <= 2) {
+            return;
+        }
+        uint16_t reg2Index = 2 - startAddress;
+        uint8_t reg2Hi = data[reg2Index * 2];
+        uint8_t reg2Lo = data[reg2Index * 2 + 1];
+
+        if ((reg2Hi & 0x40) != 0) {
+            // Compressor actively cooling.
+            stateMessage2.operatingMode = OperatingMode::Cool;
+            stateMessage2.compressorMode = CompressorMode::Cooling;
+        } else if (reg2Hi == 0x02) {
+            // Cool or Auto, compressor idle. Distinguish by low byte.
+            stateMessage2.operatingMode = (reg2Lo == 0x23)
+                ? OperatingMode::Auto
+                : OperatingMode::Cool;
+            stateMessage2.compressorMode = CompressorMode::Idle;
+        } else if (reg2Hi == 0x01) {
+            // Heat. Low byte non-zero = compressor actually heating
+            // (0x64 observed). 0x00 = standby.
+            stateMessage2.operatingMode = OperatingMode::Heat;
+            stateMessage2.compressorMode = (reg2Lo != 0x00)
+                ? CompressorMode::Heating
+                : CompressorMode::Idle;
+        } else if (reg2Hi == 0x08) {
+            stateMessage2.operatingMode = OperatingMode::FanOnly;
+            stateMessage2.compressorMode = CompressorMode::Idle;
+        } else if (reg2Hi == 0x00 && reg2Lo == 0x00) {
+            stateMessage2.operatingMode = OperatingMode::Off;
+            stateMessage2.compressorMode = CompressorMode::Idle;
+        }
+        // Unknown patterns: leave previous values untouched.
     }
 
     void Controller::applySlave1ReadResponse(uint16_t startAddress, uint16_t regCount, const uint8_t *data) {
