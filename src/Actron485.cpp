@@ -1290,7 +1290,10 @@ namespace Actron485 {
     }
 
     double Controller::getZoneSetpointTemperature(uint8_t zone) {
-        return stateMessage.zoneSetpoint[zindex(zone)];
+        // Phase 2: locate per-zone setpoint registers. Until then, every zone
+        // tracks the master setpoint, which is what the wall controller does
+        // by default for non-Ultima zones anyway.
+        return getMasterSetpoint();
     }
 
     void Controller::setZoneCurrentTemperature(uint8_t zone, double temperature) {
@@ -1298,22 +1301,19 @@ namespace Actron485 {
     }
 
     double Controller::getZoneCurrentTemperature(uint8_t zone) {
-        if (zoneMessage[zindex(zone)].type == ZoneMessageType::InitZone) {
-            // Sensor only zone or missing controller
-            return ultimaState.zoneTemperature[zindex(zone)];
-        } else {
-            return zoneMessage[zindex(zone)].temperature;
+        // Phase 1 reads zone temps from the slave 11 broadcast directly into
+        // zoneTemperature[]. Bypass the legacy stateMessage/ultimaState
+        // resolution path which never gets populated by the Modbus decoder.
+        if (zone >= 1 && zone <= 8) {
+            return zoneTemperature[zindex(zone)];
         }
+        return 0;
     }
 
     double Controller::getZoneDamperPosition(uint8_t zone) {
-        if (ultimaState.initialised) {
-            return ultimaState.zoneDamperPosition[zindex(zone)];
-        } else if (zoneMessage[zindex(zone)].initialised) {
-            return masterToZoneMessage[zindex(zone)].damperPosition;
-        } else {
-            return (getZoneOn(zone) == true) ? 1.0 : 1.0;
-        }
+        // Phase 2: locate damper position register. Until then report
+        // "open" so the UI doesn't claim every zone is closed.
+        return 1.0;
     }
 
 }
