@@ -435,6 +435,28 @@ namespace Actron485 {
             uint16_t regCount = byteCount / 2;
             const uint8_t *data = frame + 3;
 
+            // Phase 2 #DIAG (2026-04-30): log EVERY read response regardless
+            // of slave address so we can see if humidity lives on a slave we
+            // don't currently dispatch (2, 4, etc.). Remove once decoded.
+            if (printOut != nullptr && slave != 1 && slave != 3) {
+                printOut->print("[s");
+                printOut->print(slave);
+                printOut->print("-data] start=");
+                printOut->print(startAddr);
+                printOut->print(" count=");
+                printOut->print(regCount);
+                printOut->print(" :");
+                for (uint16_t i = 0; i < regCount; i++) {
+                    uint16_t word = (uint16_t(data[i * 2]) << 8) | data[i * 2 + 1];
+                    printOut->print(" 0x");
+                    if (word < 0x1000) printOut->print("0");
+                    if (word < 0x0100) printOut->print("0");
+                    if (word < 0x0010) printOut->print("0");
+                    printOut->print(word, HEX);
+                }
+                printOut->println();
+            }
+
             if (slave == 1) {
                 applySlave1ReadResponse(startAddr, regCount, data);
             } else if (slave == 3) {
