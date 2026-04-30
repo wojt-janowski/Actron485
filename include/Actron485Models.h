@@ -377,6 +377,8 @@ struct StateMessage2 {
     bool continuousFan;
     /// @brief True if system fan is running, false if off
     bool fanActive;
+    /// @brief True if quiet mode (low-noise compressor profile) is enabled
+    bool quietMode;
 
     /// @brief print state to printOut
     void print();

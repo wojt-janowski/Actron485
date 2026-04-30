@@ -406,6 +406,7 @@ std::string Actron485Api::build_state_json() {
     root["fan"] = fan_mode_to_string(demo_fan_);
     root["fan_running"] = fan_mode_to_string(demo_fan_);
     root["continuous_fan"] = demo_continuous_fan_;
+    root["quiet_mode"] = false;
     // Very simple "compressor" rule — if the system is on and in a thermal
     // mode, report the appropriate direction. Good enough to exercise
     // status/action indicators in the app.
@@ -441,6 +442,7 @@ std::string Actron485Api::build_state_json() {
     root["fan"] = fan_mode_to_string(c->getFanSpeed());
     root["fan_running"] = fan_mode_to_string(c->getRunningFanSpeed());
     root["continuous_fan"] = c->getContinuousFanMode();
+    root["quiet_mode"] = c->getQuietMode();
     root["compressor"] = compressor_to_string(c->getCompressorMode());
     root["setpoint"] = c->getMasterSetpoint();
     root["current_temperature"] = c->getMasterCurrentTemperature();

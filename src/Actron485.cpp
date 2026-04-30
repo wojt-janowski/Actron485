@@ -450,24 +450,34 @@ namespace Actron485 {
         // for compressor-active transitions (it stays at 0x80 even when the
         // compressor is cooling), so prefer slave 3 here when available.
         //
-        // Reg 2 high byte:
+        // Reg 2 high byte (bits 0-3 = mode, bit 6 = compressor cooling,
+        //                  bit 7 = quiet mode):
         //   0x02 = Cool/Auto, compressor idle
         //   0x42 (bits 1+6) = Cool, compressor cooling   (also seen 0x47/0x4A —
         //                     the low nibble seems to be a small counter)
         //   0x01 = Heat, compressor idle
         //   0x01 + low byte 0x64 = Heat, compressor heating
         //   0x08 = Fan only
+        //   +0x80 overlaid on any of the above = quiet mode flag (Phase 2
+        //                                        probe 2026-04-30: 0x01 → 0x81)
         //
         // Reg 2 low byte:
         //   0x00 = Cool        (when reg 2 hi == 0x02)
         //   0x23 = Auto        (when reg 2 hi == 0x02)
         //   ... low-nibble counters when actively cooling (0x42-0x4A range)
+        //
+        // Reg 3 high byte: bit 0 = system armed (any zone enabled),
+        //                  bit 1 = fan running (transient at spin-up),
+        //                  bit 2 = continuous-fan flag.
         if (startAddress > 2 || startAddress + regCount <= 2) {
             return;
         }
         uint16_t reg2Index = 2 - startAddress;
-        uint8_t reg2Hi = data[reg2Index * 2];
+        uint8_t reg2HiRaw = data[reg2Index * 2];
         uint8_t reg2Lo = data[reg2Index * 2 + 1];
+        // Strip quiet bit before mode matching; record it on the state.
+        stateMessage2.quietMode = (reg2HiRaw & 0x80) != 0;
+        uint8_t reg2Hi = reg2HiRaw & 0x7F;
 
         if ((reg2Hi & 0x40) != 0) {
             // Compressor actively cooling.
@@ -494,6 +504,17 @@ namespace Actron485 {
             stateMessage2.compressorMode = CompressorMode::Idle;
         }
         // Unknown patterns: leave previous values untouched.
+
+        // Continuous-fan flag lives on slave 3 reg 3 high byte bit 2 (Phase 2
+        // probe 2026-04-30). Bits 0+1 of the same byte are system-armed and
+        // fan-running indicators that we don't surface (slave 11 broadcast
+        // already gives us armed state via the zone bitmap, and fan-running
+        // is implied by compressorMode).
+        if (startAddress + regCount > 3) {
+            uint16_t reg3Index = 3 - startAddress;
+            uint8_t reg3Hi = data[reg3Index * 2];
+            stateMessage2.continuousFan = (reg3Hi & 0x04) != 0;
+        }
     }
 
     void Controller::applySlave1ReadResponse(uint16_t startAddress, uint16_t regCount, const uint8_t *data) {
@@ -549,14 +570,29 @@ namespace Actron485 {
         //          reg 2 low byte 0x00=Cool / 0x23=Auto — see PROTOCOL_NOTES)
         //   0x08 = Fan only
         //
+        // Reg 2 high byte (data[0]) carries the operating mode in bits 0-3
+        // and the **quiet-mode flag in bit 7** (Phase 2 probe 2026-04-30:
+        // 0x01 → 0x81 when quiet enabled in Heat). Mask bit 7 before mode
+        // matching so the switch still picks the right operating mode.
+        //
         // Reg 3 high byte (data[2]) is the **active-zone bitmap** — bit N set
         // means zone N+1 is enabled by the wall controller. Confirmed Phase 2
         // probe (2026-04-30): all-off → 0x00, zone 1 only → 0x01, zones 1+4 →
-        // 0x09. Earlier "Heat active = 0xFF" / "Cool active = 0x82" notes were
-        // a misread of this bitmap (0xFF was likely all 8 zones on while
-        // heating). Compressor state now comes exclusively from slave 3 reg 2
-        // (applySlave3ReadResponse — authoritative).
-        uint8_t modeWord = data[0];
+        // 0x09, zones 1+4+8 → 0x89. Earlier "Heat active = 0xFF" / "Cool
+        // active = 0x82" notes were a misread of this bitmap (0xFF = all 8
+        // zones on during heat). Compressor state now comes exclusively from
+        // slave 3 reg 2 (applySlave3ReadResponse — authoritative).
+        //
+        // Reg 3 low byte (data[3]) high nibble carries system status flags;
+        // bit 2 of that low byte = continuous-fan flag (Phase 2 probe
+        // 2026-04-30: data[3] high byte on slave 3 reg 3 went 0x01 → 0x07
+        // when continuous fan enabled). Slave 11 broadcast doesn't seem to
+        // mirror this — only slave 3 read response sees it — so continuous
+        // fan is decoded in applySlave3ReadResponse, not here.
+        uint8_t modeRaw = data[0];
+        uint8_t modeWord = modeRaw & 0x0F;
+        stateMessage2.quietMode = (modeRaw & 0x80) != 0;
+
         uint8_t zoneBitmap = data[2];
         for (int z = 0; z < 8; z++) {
             stateMessage2.zoneOn[z] = (zoneBitmap & (1 << z)) != 0;
@@ -1244,6 +1280,13 @@ namespace Actron485 {
         } else if (stateMessage2.initialised == true) {
             // Read from State 2 Message
             return stateMessage2.continuousFan;
+        }
+        return false;
+    }
+
+    bool Controller::getQuietMode() {
+        if (stateMessage2.initialised == true) {
+            return stateMessage2.quietMode;
         }
         return false;
     }

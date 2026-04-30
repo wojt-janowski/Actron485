@@ -341,6 +341,10 @@ public:
     /// @returns true if on, false otherwise
     bool getContinuousFanMode();
 
+    /// @brief get if quiet mode (low-noise compressor profile) is on
+    /// @returns true if on, false otherwise
+    bool getQuietMode();
+
     /// @brief adjusts the operating mode of the system, can also be used to turn off the system
     /// turning off will try to preserve the state
     /// @param mode Off, Fan Only, Auto, Cool, Heat. Use OffAuto, OffCool, OffHeat to change modes without turning on the system
