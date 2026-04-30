@@ -564,6 +564,35 @@ namespace Actron485 {
             return;
         }
 
+        // Phase 2 #DIAG (2026-04-30): humidity probe. Slave 1 only responds
+        // when the compressor is active. Dump all decoded floats so we can
+        // identify which index carries the indoor humidity reading. Remove
+        // once humidity is decoded.
+        if (printOut != nullptr) {
+            printOut->print("[s1-floats] start=");
+            printOut->print(startAddress);
+            printOut->print(" count=");
+            printOut->print(regCount);
+            printOut->print(" :");
+            for (uint16_t i = 0; i + 1 < regCount; i += 2) {
+                uint16_t regAddr = startAddress + i;
+                uint16_t a = (uint16_t(data[i * 2]) << 8) | data[i * 2 + 1];
+                uint16_t b = (uint16_t(data[i * 2 + 2]) << 8) | data[i * 2 + 3];
+                uint32_t raw = (uint32_t(a) << 16) | b;
+                float val;
+                memcpy(&val, &raw, sizeof(val));
+                printOut->print(" r");
+                printOut->print(regAddr);
+                printOut->print("=");
+                if (std::isfinite(val)) {
+                    printOut->print(double(val), 3);
+                } else {
+                    printOut->print("nan");
+                }
+            }
+            printOut->println();
+        }
+
         uint16_t offsetHigh = (outdoorRegHigh - startAddress) * 2;
         uint16_t regA = (uint16_t(data[offsetHigh]) << 8) | data[offsetHigh + 1];
         uint16_t regB = (uint16_t(data[offsetHigh + 2]) << 8) | data[offsetHigh + 3];
