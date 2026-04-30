@@ -505,15 +505,51 @@ namespace Actron485 {
         }
         // Unknown patterns: leave previous values untouched.
 
-        // Continuous-fan flag lives on slave 3 reg 3 high byte bit 2 (Phase 2
-        // probe 2026-04-30). Bits 0+1 of the same byte are system-armed and
-        // fan-running indicators that we don't surface (slave 11 broadcast
-        // already gives us armed state via the zone bitmap, and fan-running
-        // is implied by compressorMode).
+        // Reg 3 carries fan setting + status flags (Phase 2 probe 2026-04-30):
+        //
+        //   High byte:
+        //     bit 0 = system armed
+        //     bit 1 = fan running (transient at spin-up; also set in non-fan-
+        //             only modes when fan is auto-running)
+        //     bit 2 = continuous fan flag
+        //     (in Fan-only mode, bits 3-7 ALSO reflect the user-selected fan
+        //      speed: bit 3 = Low, bit 4 = Medium, bit 6 = High; we read the
+        //      low byte instead since it's mode-independent)
+        //
+        //   Low byte = explicit fan speed value:
+        //     0x00 = Auto / Esp (let the system pick)
+        //     0x28 (40) = Low
+        //     0x3D (61) = Medium
+        //     0x59 (89) = High
+        //   Holds across Heat/Cool/Fan-only — in thermal modes, 0x00 (Auto)
+        //   is the typical default.
         if (startAddress + regCount > 3) {
             uint16_t reg3Index = 3 - startAddress;
             uint8_t reg3Hi = data[reg3Index * 2];
+            uint8_t reg3Lo = data[reg3Index * 2 + 1];
             stateMessage2.continuousFan = (reg3Hi & 0x04) != 0;
+
+            FanMode decodedFan;
+            switch (reg3Lo) {
+                case 0x00: decodedFan = FanMode::Esp;    break;  // "Auto" on the LCD
+                case 0x28: decodedFan = FanMode::Low;    break;
+                case 0x3D: decodedFan = FanMode::Medium; break;
+                case 0x59: decodedFan = FanMode::High;   break;
+                default:
+                    // Unknown — leave previous values rather than silently
+                    // misreporting. Probe more values if they crop up.
+                    decodedFan = stateMessage2.fanMode;
+                    break;
+            }
+            stateMessage2.fanMode = decodedFan;
+            // Running fan is what's actually moving air right now. In
+            // Fan-only mode the requested speed IS what's running; in
+            // thermal modes it's only running when the compressor calls for
+            // it (bit 1 of reg 3 high byte indicates that).
+            stateMessage2.runningFanMode = ((reg3Hi & 0x02) != 0)
+                ? decodedFan
+                : FanMode::Off;
+            stateMessage2.fanActive = (reg3Hi & 0x02) != 0;
         }
     }
 
