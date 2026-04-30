@@ -445,6 +445,27 @@ namespace Actron485 {
     }
 
     void Controller::applySlave3ReadResponse(uint16_t startAddress, uint16_t regCount, const uint8_t *data) {
+        // Phase 2 #DIAG (2026-04-30): humidity probe. Dump every slave 3 read
+        // response so we can spot polls outside the usual reg 2-0x18 window
+        // (humidity sensor probably lives on the wall controller). Format:
+        // `[s3-data] start=N count=M : 0xAABB 0xCCDD ...` Raw 16-bit words.
+        if (printOut != nullptr) {
+            printOut->print("[s3-data] start=");
+            printOut->print(startAddress);
+            printOut->print(" count=");
+            printOut->print(regCount);
+            printOut->print(" :");
+            for (uint16_t i = 0; i < regCount; i++) {
+                uint16_t word = (uint16_t(data[i * 2]) << 8) | data[i * 2 + 1];
+                printOut->print(" 0x");
+                if (word < 0x1000) printOut->print("0");
+                if (word < 0x0100) printOut->print("0");
+                if (word < 0x0010) printOut->print("0");
+                printOut->print(word, HEX);
+            }
+            printOut->println();
+        }
+
         // Slave 3 read at start=2 count=11 carries the AC head's authoritative
         // operating-mode + compressor state. Slave 11's broadcast lags behind
         // for compressor-active transitions (it stays at 0x80 even when the
