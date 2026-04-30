@@ -549,36 +549,33 @@ namespace Actron485 {
         //          reg 2 low byte 0x00=Cool / 0x23=Auto — see PROTOCOL_NOTES)
         //   0x08 = Fan only
         //
-        // Compressor active flag lives in reg 3 high byte (data[2]):
-        //   Cool idle:    0x80           Cool active:  0x82  (bit 1 set)
-        //   Heat idle:    0x80           Heat active:  0xFF  (all bits set!)
-        //   Fan / Off:    0x80 / 0x00    (compressor never runs)
-        // The Heat-active sentinel is a deliberate "all flags lit" indicator
-        // distinct from Cool's single-bit. Treat it as compressor=Heating.
+        // Reg 3 high byte (data[2]) is the **active-zone bitmap** — bit N set
+        // means zone N+1 is enabled by the wall controller. Confirmed Phase 2
+        // probe (2026-04-30): all-off → 0x00, zone 1 only → 0x01, zones 1+4 →
+        // 0x09. Earlier "Heat active = 0xFF" / "Cool active = 0x82" notes were
+        // a misread of this bitmap (0xFF was likely all 8 zones on while
+        // heating). Compressor state now comes exclusively from slave 3 reg 2
+        // (applySlave3ReadResponse — authoritative).
         uint8_t modeWord = data[0];
-        uint8_t modeFlags = data[2];
-        if (modeWord == 0x00 && modeFlags == 0x00) {
+        uint8_t zoneBitmap = data[2];
+        for (int z = 0; z < 8; z++) {
+            stateMessage2.zoneOn[z] = (zoneBitmap & (1 << z)) != 0;
+        }
+        if (modeWord == 0x00 && zoneBitmap == 0x00) {
             stateMessage2.operatingMode = OperatingMode::Off;
             stateMessage2.compressorMode = CompressorMode::Idle;
         } else {
             switch (modeWord) {
                 case 0x01:
                     stateMessage2.operatingMode = OperatingMode::Heat;
-                    stateMessage2.compressorMode = (modeFlags == 0xFF)
-                        ? CompressorMode::Heating
-                        : CompressorMode::Idle;
                     break;
                 case 0x02:
-                    // Default to Cool — Auto vs Cool disambiguation needs
-                    // slave 3 read response decoding (separate Phase 2 task).
+                    // Default to Cool — Auto vs Cool disambiguation comes
+                    // from slave 3 read response (separate Phase 2 task).
                     stateMessage2.operatingMode = OperatingMode::Cool;
-                    stateMessage2.compressorMode = (modeFlags & 0x02)
-                        ? CompressorMode::Cooling
-                        : CompressorMode::Idle;
                     break;
                 case 0x08:
                     stateMessage2.operatingMode = OperatingMode::FanOnly;
-                    stateMessage2.compressorMode = CompressorMode::Idle;
                     break;
                 default:
                     // Unknown — leave previous values rather than spuriously
