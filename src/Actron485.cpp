@@ -558,16 +558,11 @@ namespace Actron485 {
         // count=18 read. Float index 5 (regs 130/131) is the outdoor temperature
         // sensor — confirmed against the wall LCD's "Outdoor" reading (~18.7°C).
         // Encoding is big-endian IEEE-754 with the high half-word first (ABCD).
-        const uint16_t outdoorRegHigh = 130;
-        const uint16_t outdoorRegLow = 131;
-        if (startAddress > outdoorRegHigh || startAddress + regCount <= outdoorRegLow) {
-            return;
-        }
-
         // Phase 2 #DIAG (2026-04-30): humidity probe. Slave 1 only responds
-        // when the compressor is active. Dump all decoded floats so we can
-        // identify which index carries the indoor humidity reading. Remove
-        // once humidity is decoded.
+        // when the compressor is active. Dump all decoded floats from EVERY
+        // slave 1 read response so we can identify which register block
+        // carries the indoor humidity reading. Remove once humidity is
+        // decoded. Placed BEFORE the reg-120 filter so we see any block.
         if (printOut != nullptr) {
             printOut->print("[s1-floats] start=");
             printOut->print(startAddress);
@@ -591,6 +586,12 @@ namespace Actron485 {
                 }
             }
             printOut->println();
+        }
+
+        const uint16_t outdoorRegHigh = 130;
+        const uint16_t outdoorRegLow = 131;
+        if (startAddress > outdoorRegHigh || startAddress + regCount <= outdoorRegLow) {
+            return;
         }
 
         uint16_t offsetHigh = (outdoorRegHigh - startAddress) * 2;
