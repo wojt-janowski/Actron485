@@ -682,12 +682,23 @@ namespace Actron485 {
             zoneTemperature[z] = zoneSetpoint[z] + (double(offset) * 0.1);
         }
 
-        // Master setpoint surrogate: the master setpoint shown on the wall
-        // LCD doesn't have a confirmed register here yet. Zone 1's setpoint
-        // is a workable proxy on this rig because the wall controller anchors
-        // the master to the control zone, which is typically zone 1. Phase 2
-        // task #7 will revisit once the real register is found.
-        stateMessage2.setpoint = firstValidSetpoint;
+        // Master setpoint = the wall-controller zone's setpoint (Phase 2 #11
+        // confirmed 2026-04-30: bumping master on the LCD only changes that
+        // zone's setpoint cleanly; other active zones get pulled too but
+        // some end up clamped to the master±2°C window so they're not
+        // reliable). The wall-controller zone is configured via the climate
+        // component's `control_zone:` yaml setting, which calls
+        // setControlZone(N, true). We pick the first such zone with a valid
+        // setpoint and fall back to the first non-zero setpoint for
+        // backward compatibility on rigs that don't configure it.
+        double masterSetpoint = -1.0;
+        for (int z = 0; z < 8; z++) {
+            if (zoneControlled[z] && zoneSetpoint[z] > 0.0) {
+                masterSetpoint = zoneSetpoint[z];
+                break;
+            }
+        }
+        stateMessage2.setpoint = (masterSetpoint > 0.0) ? masterSetpoint : firstValidSetpoint;
 
         // Master indoor temp stop-gap remains the mean of all 8 zone temps
         // until Phase 2 task #2 locates the wall-controller thermistor

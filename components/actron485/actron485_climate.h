@@ -77,10 +77,14 @@ class Actron485Climate : public climate::Climate, public Component {
         void set_has_esp(bool available) { has_esp_auto_ = available; }
         void set_logging_mode(int logging_mode) { logging_mode_ = logging_mode; }
         void set_uart_parent(uart::UARTComponent *parent) { this->stream_.set_uart(parent); }
-        void set_ultima_settings(bool available, bool adjusts_master_target) { 
+        void set_ultima_settings(bool available, bool adjusts_master_target) {
             has_ultima_ = available;
-            ultima_adjusts_master_setpoint_ = adjusts_master_target; 
+            ultima_adjusts_master_setpoint_ = adjusts_master_target;
         }
+        // 1-indexed zone number where the wall controller lives. The master
+        // setpoint shown on the LCD is sourced from this zone's setpoint
+        // (see applySlave11StateBroadcast).
+        void set_control_zone(int zone_number) { control_zone_number_ = zone_number; }
 
         void add_zone(int number, Actron485ZoneFan *fan);
         void add_ultima_zone(int number, Actron485ZoneClimate *climate);
@@ -115,6 +119,7 @@ class Actron485Climate : public climate::Climate, public Component {
         bool has_esp_auto_;
         bool has_ultima_;
         bool ultima_adjusts_master_setpoint_;
+        int control_zone_number_ = 1;
         Actron485ZoneFan *zones_[8] = {};
         Actron485ZoneClimate *zone_climates_[8] = {};
 

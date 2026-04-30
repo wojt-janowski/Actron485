@@ -61,6 +61,12 @@ void Actron485Climate::setup() {
         we_pin_->pin_mode(gpio::FLAG_OUTPUT);
     }
     actron_controller.configure(stream_, we_pin);
+    // Tell the controller which zone hosts the wall thermostat. Master
+    // setpoint surfaces from that zone's setpoint (the LCD shows what the
+    // wall-controller zone is targeting).
+    if (control_zone_number_ >= 1 && control_zone_number_ <= 8) {
+        actron_controller.setControlZone((uint8_t) control_zone_number_, true);
+    }
     logStream_ = LogStream();
     if (logging_mode_ > 0) {
         actron_controller.configureLogging(&logStream_);

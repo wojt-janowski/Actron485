@@ -21,6 +21,7 @@ CONF_ULTIMA = "ultima"
 CONF_ULTIMA_AVAILABLE = "available"
 CONF_ULTIMA_ZONES_ADJUSTS_MASTER = "adjust_master_target"
 CONF_LOGGING_MODE = "logging_mode"
+CONF_CONTROL_ZONE = "control_zone"
 
 CONF_ZONE_NUMBER = "number"
 CONF_ZONE_NAME = "name"
@@ -69,9 +70,10 @@ CONFIG_SCHEMA = cv.All(
             cv.Required(CONF_ZONES): cv.All(
                 cv.ensure_list(ZONE_ENTRY_PARAMETER), cv.Length(min=1, max=8)
             ),
-            cv.Optional(CONF_LOGGING_MODE, default="STATUS"): cv.enum(ALLOWED_LOGGING_MODES, upper=True),  
+            cv.Optional(CONF_LOGGING_MODE, default="STATUS"): cv.enum(ALLOWED_LOGGING_MODES, upper=True),
             cv.Optional(CONF_ESP_FAN_AVAILABLE, default=False): cv.boolean,
             cv.Optional(CONF_ULTIMA): cv.Schema(ultima_config_parameter),
+            cv.Optional(CONF_CONTROL_ZONE, default=1): cv.int_range(min=1, max=8),
         }
     )
     .extend(uart.UART_DEVICE_SCHEMA)
@@ -116,6 +118,8 @@ async def to_code(config):
 
     has_esp = config[CONF_ESP_FAN_AVAILABLE]
     cg.add(var.set_has_esp(has_esp))
+
+    cg.add(var.set_control_zone(config[CONF_CONTROL_ZONE]))
 
     has_ultima = False
     if CONF_ULTIMA in config:
