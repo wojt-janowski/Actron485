@@ -63,6 +63,23 @@ class Controller {
     /// `frame` must be `length` bytes long; CRC is computed and appended.
     void transmitModbusFrame(uint8_t *frame, uint8_t length);
 
+    /// @brief Encode a single zone's setpoint + offset into the slave-3
+    /// reg 5-12 layout: high byte = setpoint × 2, low byte = signed int8
+    /// tenths-of-°C (current − setpoint), clamped to [-128, 127].
+    /// `currentTemperature` may be NaN — in that case the offset byte is 0
+    /// so the AMIB sees "at-setpoint" rather than nonsense.
+    uint16_t encodeSlave3ZoneRegister(double setpoint, double currentTemperature);
+    /// @brief Recompute every slave-3 register that depends on internal
+    /// state (mode, system-on, fan, zones, setpoints, offsets) and write
+    /// it into `_slaveRegisters`. Cheap — call from any setter or when a
+    /// zone temperature push arrives. No-op when responder is disabled.
+    void renderSlave3State();
+    /// @brief Populate `_slaveRegisters` with the static values the AMIB
+    /// expects on slave-3 reads outside the live state window: regs 0-1
+    /// (constants), 30-33 (cool/heat bounds), 100 (system-alive). Called
+    /// once when slave-responder mode is enabled for slave 3.
+    void initSlave3Defaults();
+
     /// @brief Per-(slave, address) value cache for PrintOutMode::RegisterDelta.
     /// We've seen ~50 distinct (slave, addr) pairs on this bus; 256 slots is
     /// generous but cheap (~2 KB).

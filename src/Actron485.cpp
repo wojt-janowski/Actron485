@@ -1315,6 +1315,15 @@ namespace Actron485 {
     void Controller::setSlaveResponderMode(uint8_t slaveId, bool enabled) {
         _slaveResponderId = slaveId;
         _slaveResponderEnabled = enabled;
+        // When stepping into slave-3 responder mode, prime the buffer so the
+        // first AMIB poll (within ~6s) sees coherent state rather than zeros.
+        // initSlave3Defaults() seeds the static / configuration regs; the
+        // live-state regs get filled by renderSlave3State() reading from
+        // stateMessage2 + zoneSetpoint[] + zoneTemperature[].
+        if (enabled && slaveId == 3) {
+            initSlave3Defaults();
+            renderSlave3State();
+        }
     }
 
     void Controller::setSlaveRegister(uint16_t address, uint16_t value) {
@@ -1357,6 +1366,145 @@ namespace Actron485 {
             frame[3 + i * 2 + 1] = uint8_t(value & 0xFF);
         }
         transmitModbusFrame(frame, frameLen);
+    }
+
+    // Static slave-3 register values the AMIB expects to find. Decoded from
+    // captures (see PROTOCOL_NOTES.md — "Slave 3" sections and "Phase 3A"
+    // address-space inventory). regs 0-1 are constants the wall LCD always
+    // returns; regs 30-33 are static cool/heat min/max bounds in tenths °C;
+    // reg 100 is a system-alive sentinel polled at low cadence.
+    void Controller::initSlave3Defaults() {
+        _slaveRegisters[0]   = 0x00B4;
+        _slaveRegisters[1]   = 0x0C72;
+        _slaveRegisters[30]  = 0x05DC;  // 1500 → 15.0 °C
+        _slaveRegisters[31]  = 0x050A;  // 1290 → 12.9 °C
+        _slaveRegisters[32]  = 0x047E;  // 1150 → 11.5 °C
+        _slaveRegisters[33]  = 0x0A00;  // 2560 → 25.6 °C
+        _slaveRegisters[100] = 0x00FF;
+
+        // Seed zoneSetpoint to a safe room-temp default so the first AMIB
+        // poll doesn't see "every zone at 0°C with 0 offset" before any
+        // HTTP write lands. NaN for zoneTemperature signals "no reading"
+        // — encodeSlave3ZoneRegister maps NaN to a zero offset byte, which
+        // the AMIB treats as at-setpoint (no demand). zoneTemperature
+        // defaults to 0.0 from in-class init; set NaN here explicitly.
+        for (int z = 0; z < 8; z++) {
+            if (zoneSetpoint[z] == 0.0) {
+                zoneSetpoint[z] = 22.0;
+            }
+            if (zoneTemperature[z] == 0.0) {
+                zoneTemperature[z] = std::nan("");
+            }
+        }
+    }
+
+    // Pack one zone's setpoint and observed temperature into the wire format
+    // used by slave-3 regs 5-12: high byte = setpoint × 2 (0.5 °C step), low
+    // byte = signed int8 tenths-of-°C offset (current − setpoint). When the
+    // current temp is missing (NaN), we report a zero offset so the AMIB
+    // treats the zone as at-setpoint — better than feeding it -12.8 °C of
+    // spurious demand that would force the system to call for heat/cool.
+    uint16_t Controller::encodeSlave3ZoneRegister(double setpoint, double currentTemperature) {
+        // Clamp setpoint to the bounds expected by the AMIB (regs 30-33).
+        // 0.0-127.5 fits in an unsigned byte once × 2; the legal user range
+        // is much narrower (~12-30 °C) but the encoding is the constraint.
+        if (setpoint < 0.0) setpoint = 0.0;
+        if (setpoint > 127.5) setpoint = 127.5;
+        uint8_t setpointByte = uint8_t(setpoint * 2.0 + 0.5);
+
+        int8_t offsetByte = 0;
+        if (std::isfinite(currentTemperature) && std::isfinite(setpoint)) {
+            double tenths = (currentTemperature - setpoint) * 10.0;
+            if (tenths > 127.0) tenths = 127.0;
+            if (tenths < -128.0) tenths = -128.0;
+            offsetByte = int8_t(tenths >= 0 ? tenths + 0.5 : tenths - 0.5);
+        }
+        return (uint16_t(setpointByte) << 8) | uint8_t(offsetByte);
+    }
+
+    // Re-encode the entire live-state region of the slave-3 buffer (regs 2-12)
+    // from the controller's typed state. Cheap enough to call from every
+    // setter — eight zone regs plus three header regs = ~40 lines of byte
+    // arithmetic. No-op when slave-responder mode is disabled, so callers
+    // can invoke it unconditionally.
+    void Controller::renderSlave3State() {
+        if (!_slaveResponderEnabled || _slaveResponderId != 3) {
+            return;
+        }
+
+        // Mirror the read-side decode in applySlave3ReadResponse(): mode lives
+        // in reg 2 high byte. We only express user-facing state here (the
+        // compressor sub-state in the low byte is set by the AMIB/AC head
+        // downstream — we report "idle" values so we don't lie about the
+        // hardware). Quiet bit (0x80) is OR'd in when stateMessage2 says so.
+        uint8_t reg2Hi = 0x00;
+        uint8_t reg2Lo = 0x00;
+        OperatingMode mode = stateMessage2.initialised ? stateMessage2.operatingMode : OperatingMode::Off;
+        switch (mode) {
+            case OperatingMode::Heat:
+                reg2Hi = 0x01;
+                break;
+            case OperatingMode::Cool:
+                reg2Hi = 0x02;
+                reg2Lo = 0x00;
+                break;
+            case OperatingMode::Auto:
+                reg2Hi = 0x02;
+                reg2Lo = 0x23;
+                break;
+            case OperatingMode::FanOnly:
+                reg2Hi = 0x08;
+                break;
+            case OperatingMode::Off:
+            default:
+                reg2Hi = 0x00;
+                reg2Lo = 0x00;
+                break;
+        }
+        if (stateMessage2.quietMode) {
+            reg2Hi |= 0x80;
+        }
+        _slaveRegisters[2] = (uint16_t(reg2Hi) << 8) | reg2Lo;
+
+        // Reg 3: high byte = zone-enable bitmap (zone N → bit N-1); low byte
+        // = fan speed. Continuous fan is bit 2 of the high byte, which
+        // collides with zone 3 in the bitmap — until we have a cleaner
+        // separation, prefer zone state and accept that continuous fan won't
+        // round-trip when zone 3 is on. See PROTOCOL_NOTES Phase 3A2.
+        uint8_t reg3Hi = 0x00;
+        for (int z = 0; z < 8; z++) {
+            if (stateMessage2.zoneOn[z]) {
+                reg3Hi |= uint8_t(1 << z);
+            }
+        }
+        uint8_t reg3Lo;
+        switch (stateMessage2.fanMode) {
+            case FanMode::Low:
+            case FanMode::LowContinuous:       reg3Lo = 0x28; break;
+            case FanMode::Medium:
+            case FanMode::MediumContinuous:    reg3Lo = 0x3D; break;
+            case FanMode::High:
+            case FanMode::HighContinuous:      reg3Lo = 0x59; break;
+            case FanMode::Esp:
+            case FanMode::EspContinuous:
+            default:                           reg3Lo = 0x00; break;
+        }
+        _slaveRegisters[3] = (uint16_t(reg3Hi) << 8) | reg3Lo;
+
+        // Reg 4: bit 1 of the high byte = system-on. Low byte is a constant
+        // 0x23 — never observed varying across the captured off/on transitions.
+        bool systemOn = mode != OperatingMode::Off && mode != OperatingMode::OffAuto
+            && mode != OperatingMode::OffCool && mode != OperatingMode::OffHeat;
+        _slaveRegisters[4] = systemOn ? 0x0223 : 0x0023;
+
+        // Regs 5-12: one per zone. Setpoint comes from zoneSetpoint[]
+        // (driven by setZoneSetpointTemperatureCustom + setMasterSetpoint),
+        // current temperature from zoneTemperature[] (driven by remote-sensor
+        // POSTs via setZoneCurrentTemperature).
+        for (int z = 0; z < 8; z++) {
+            _slaveRegisters[5 + z] = encodeSlave3ZoneRegister(
+                zoneSetpoint[z], zoneTemperature[z]);
+        }
     }
 
     // Append CRC-16 (Modbus, poly 0xA001) to `frame` and transmit. Caller
