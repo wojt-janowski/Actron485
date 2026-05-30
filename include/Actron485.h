@@ -43,6 +43,26 @@ class Controller {
     uint16_t _modbusLastReadCount = 0;
     unsigned long _modbusLastReadTimestamp = 0;
 
+    /// @brief Slave-responder mode. When `_slaveResponderEnabled` is true and
+    /// an inbound Modbus request is addressed to `_slaveResponderId`, the
+    /// controller transmits a response built from `_slaveRegisters`.
+    /// Default off — must be explicitly enabled via `setSlaveResponderMode()`.
+    bool _slaveResponderEnabled = false;
+    uint8_t _slaveResponderId = 0;
+    /// @brief Flat per-address response buffer for slave-responder mode.
+    /// Index = register address. We size to 256 because the AMIB has only
+    /// ever been observed polling slave 3 within addresses 2-33; 256 is a
+    /// generous bound that fits the ESP32 RAM budget (~512 B).
+    static const size_t _slaveRegistersCount = 256;
+    uint16_t _slaveRegisters[_slaveRegistersCount] = {};
+
+    /// @brief Build and transmit a Modbus 0x03 response for the request
+    /// `startAddr`/`regCount`, sourcing values from `_slaveRegisters`.
+    void transmitSlaveReadResponse(uint16_t startAddr, uint16_t regCount);
+    /// @brief Send a raw, CRC-appended frame on the bus (used by responder).
+    /// `frame` must be `length` bytes long; CRC is computed and appended.
+    void transmitModbusFrame(uint8_t *frame, uint8_t length);
+
     /// @brief Per-(slave, address) value cache for PrintOutMode::RegisterDelta.
     /// We've seen ~50 distinct (slave, addr) pairs on this bus; 256 slots is
     /// generous but cheap (~2 KB).
@@ -304,6 +324,26 @@ public:
     /// @param zone
     /// @return true if this module is controlling the specified zone
     bool getControlZone(uint8_t zone);
+
+    /// @brief Enable or disable Modbus slave-responder mode.
+    /// When enabled, inbound Function 0x03/0x06/0x10 requests addressed to
+    /// `slaveId` are answered from `_slaveRegisters`. Use this to impersonate
+    /// the wall controller (slave 3) once it has been physically disconnected
+    /// from the J6 DATA bus — the AMIB master will then drive AC behaviour
+    /// from whatever state we report. Default off; populating registers via
+    /// `setSlaveRegister()` has no on-bus effect until enabled.
+    void setSlaveResponderMode(uint8_t slaveId, bool enabled);
+
+    /// @brief Whether slave-responder mode is currently active.
+    bool getSlaveResponderEnabled() { return _slaveResponderEnabled; }
+    uint8_t getSlaveResponderId() { return _slaveResponderId; }
+
+    /// @brief Set a register in the slave-responder buffer. The next time the
+    /// AMIB polls a range covering this address, the new value is returned.
+    void setSlaveRegister(uint16_t address, uint16_t value);
+    /// @brief Read back a register from the slave-responder buffer (last
+    /// value we set OR last value the AMIB wrote to us via 0x06/0x10).
+    uint16_t getSlaveRegister(uint16_t address);
 
     // System Control
     // Generally if receivingData() is returning false sending commands are dropped as most commands

@@ -403,16 +403,72 @@ namespace Actron485 {
             }
             const uint8_t *data = frame + 7;
 
+            // Slave-responder mode: capture writes addressed to us into our
+            // register buffer so the API/diagnostics can observe them. e.g.
+            // when impersonating slave 3, the AMIB writes the compressor PWM
+            // block (reg 21-28) to us — we don't act on it, just store it.
+            if (_slaveResponderEnabled && slave == _slaveResponderId) {
+                for (uint16_t i = 0; i < regCount; i++) {
+                    uint16_t addr = startAddr + i;
+                    if (addr >= _slaveRegistersCount) break;
+                    _slaveRegisters[addr] =
+                        (uint16_t(data[i * 2]) << 8) | data[i * 2 + 1];
+                }
+                // Per Modbus spec, function 0x10 expects an echo response:
+                // [slave][0x10][addrHi][addrLo][cntHi][cntLo][crcLo][crcHi].
+                // Without it the AMIB may retry / mark us offline.
+                uint8_t resp[8];
+                resp[0] = _slaveResponderId;
+                resp[1] = 0x10;
+                resp[2] = uint8_t(startAddr >> 8);
+                resp[3] = uint8_t(startAddr & 0xFF);
+                resp[4] = uint8_t(regCount >> 8);
+                resp[5] = uint8_t(regCount & 0xFF);
+                transmitModbusFrame(resp, 6);
+                return;
+            }
+
             if (slave == 11) {
                 applySlave11StateBroadcast(startAddr, regCount, data, byteCount);
             }
             return;
         }
 
+        // Function 0x06: Write Single Register Request (slave-responder only).
+        // Layout: [slave][0x06][addrHi][addrLo][valHi][valLo][crcLo][crcHi].
+        // Capture-and-echo, mirroring 0x10 behaviour above. We've never seen
+        // the AMIB use 0x06 in normal operation but the BMS spec documents
+        // it as supported, so handle it for completeness.
+        if (function == 0x06 && length == 8) {
+            if (_slaveResponderEnabled && slave == _slaveResponderId) {
+                uint16_t addr = (uint16_t(frame[2]) << 8) | frame[3];
+                uint16_t value = (uint16_t(frame[4]) << 8) | frame[5];
+                if (addr < _slaveRegistersCount) {
+                    _slaveRegisters[addr] = value;
+                }
+                // 0x06 echo is byte-identical to the request frame (sans CRC,
+                // which we recompute).
+                uint8_t resp[8];
+                memcpy(resp, frame, 6);
+                transmitModbusFrame(resp, 6);
+                return;
+            }
+        }
+
         // Function 0x03: Read Holding Registers
         if (function == 0x03) {
             // Request: 8 bytes total
             if (length == 8) {
+                // Slave-responder mode: AMIB is asking us for state. Build
+                // and transmit response from our register buffer. Must happen
+                // before the read-context bookkeeping below — that path is
+                // for *us* tracking other slaves' responses, not for our own.
+                if (_slaveResponderEnabled && slave == _slaveResponderId) {
+                    uint16_t startAddr = (uint16_t(frame[2]) << 8) | frame[3];
+                    uint16_t regCount = (uint16_t(frame[4]) << 8) | frame[5];
+                    transmitSlaveReadResponse(startAddr, regCount);
+                    return;
+                }
                 _modbusLastReadSlave = slave;
                 _modbusLastReadFunction = function;
                 _modbusLastReadStartAddress = (uint16_t(frame[2]) << 8) | frame[3];
@@ -1241,6 +1297,84 @@ namespace Actron485 {
 
     bool Controller::getControlZone(uint8_t zone) {
         return zoneControlled[zindex(zone)];
+    }
+
+    // Modbus slave-responder mode (Phase 3, 2026-05-01).
+    //
+    // When enabled, inbound Modbus requests addressed to `_slaveResponderId`
+    // are answered from `_slaveRegisters`. Function 0x03 (read) builds and
+    // transmits a response; 0x06/0x10 (write) update our buffer so we can
+    // observe what the AMIB master writes to us (e.g. compressor PWM block
+    // at slave 3 reg 21-28).
+    //
+    // INTENDED USE: physically disconnect the wall controller from the J6
+    // DATA bus, then enable this with `slaveId = 3`. The AMIB will poll us
+    // as if we were the wall controller; whatever state we expose drives
+    // the AC. Leaving this disabled is safe — the responder makes no bus
+    // transmissions and `_slaveRegisters` is just inert RAM.
+    void Controller::setSlaveResponderMode(uint8_t slaveId, bool enabled) {
+        _slaveResponderId = slaveId;
+        _slaveResponderEnabled = enabled;
+    }
+
+    void Controller::setSlaveRegister(uint16_t address, uint16_t value) {
+        if (address >= _slaveRegistersCount) {
+            return;
+        }
+        _slaveRegisters[address] = value;
+    }
+
+    uint16_t Controller::getSlaveRegister(uint16_t address) {
+        if (address >= _slaveRegistersCount) {
+            return 0;
+        }
+        return _slaveRegisters[address];
+    }
+
+    // Build a Modbus 0x03 Read Holding Registers response for the requested
+    // address range, sourcing values from our register buffer, and transmit
+    // it on the bus. Modbus inter-frame timeout at 4800 baud is ~7 ms — the
+    // ESP32 reaches `serialWrite(true)` and the first byte well within that.
+    void Controller::transmitSlaveReadResponse(uint16_t startAddr, uint16_t regCount) {
+        // Cap at 125 registers per Modbus spec, plus our buffer bounds.
+        if (regCount == 0 || regCount > 125) {
+            return;
+        }
+        if (uint32_t(startAddr) + regCount > _slaveRegistersCount) {
+            return;
+        }
+        // Frame: [slave][0x03][byteCount][hi0 lo0 ... hiN loN][crcLo][crcHi]
+        // Max payload: 125 * 2 = 250 bytes. Total max: 5 + 250 = 255 bytes.
+        uint8_t byteCount = uint8_t(regCount * 2);
+        uint8_t frameLen = 3 + byteCount;  // before CRC
+        uint8_t frame[256];
+        frame[0] = _slaveResponderId;
+        frame[1] = 0x03;
+        frame[2] = byteCount;
+        for (uint16_t i = 0; i < regCount; i++) {
+            uint16_t value = _slaveRegisters[startAddr + i];
+            frame[3 + i * 2] = uint8_t(value >> 8);
+            frame[3 + i * 2 + 1] = uint8_t(value & 0xFF);
+        }
+        transmitModbusFrame(frame, frameLen);
+    }
+
+    // Append CRC-16 (Modbus, poly 0xA001) to `frame` and transmit. Caller
+    // sized `frame` to length+2.
+    void Controller::transmitModbusFrame(uint8_t *frame, uint8_t length) {
+        if (_serial == nullptr) {
+            return;
+        }
+        uint16_t crc = checksumModbus(frame, length);
+        frame[length] = uint8_t(crc & 0xFF);
+        frame[length + 1] = uint8_t(crc >> 8);
+        uint8_t total = uint8_t(length + 2);
+
+        serialWrite(true);
+        _serial->write(frame, total);
+        _serial->flush();
+        serialWrite(false);
+        dataLastSentTime = platformMillis();
     }
 
     // System Control
