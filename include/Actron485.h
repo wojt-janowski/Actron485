@@ -80,15 +80,20 @@ class Controller {
     /// once when slave-responder mode is enabled for slave 3.
     void initSlave3Defaults();
 
+public:
     /// @brief Per-(slave, address) value cache for PrintOutMode::RegisterDelta.
-    /// We've seen ~50 distinct (slave, addr) pairs on this bus; 256 slots is
-    /// generous but cheap (~2 KB).
+    /// Defined here in public scope so external code (e.g. the actron485_api
+    /// component's bus-diagnostics endpoint) can iterate entries without
+    /// poking into private members. The backing array is still private.
     struct RegisterCacheEntry {
         uint8_t slave;
         uint16_t address;
         uint16_t value;
         unsigned long lastSeenMs;
     };
+private:
+    /// We've seen ~50 distinct (slave, addr) pairs on this bus; 256 slots is
+    /// generous but cheap (~2 KB).
     static const size_t _registerCacheCapacity = 256;
     RegisterCacheEntry _registerCache[_registerCacheCapacity] = {};
     size_t _registerCacheCount = 0;
@@ -361,6 +366,17 @@ public:
     /// @brief Read back a register from the slave-responder buffer (last
     /// value we set OR last value the AMIB wrote to us via 0x06/0x10).
     uint16_t getSlaveRegister(uint16_t address);
+
+    /// @brief Number of populated entries in the (slave, address) register
+    /// cache. Populated only when `printOutMode == PrintOutMode::RegisterDelta`
+    /// — i.e. when `logging_mode: DELTA` is set in YAML. Stays at 0 in other
+    /// modes; diagnostics consumers should treat an empty cache as "not
+    /// captured this run" rather than "no bus activity".
+    size_t getRegisterCacheCount() { return _registerCacheCount; }
+    /// @brief Random-access entry view for the register cache. Caller must
+    /// not retain the reference across `loop()` invocations — entries are
+    /// updated in place when their value changes.
+    const RegisterCacheEntry &getRegisterCacheEntry(size_t i) { return _registerCache[i]; }
 
     // System Control
     // Generally if receivingData() is returning false sending commands are dropped as most commands

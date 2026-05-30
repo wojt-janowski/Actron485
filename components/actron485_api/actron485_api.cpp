@@ -377,14 +377,30 @@ void Actron485Api::loop() {
   if (now - last_stale_check_ms_ < 1000) return;
   last_stale_check_ms_ = now;
 
+  // In slave-3 responder mode, "release wall-controller role" is
+  // meaningless — WE are the wall controller, there's nothing to fall back
+  // to. Dropping zoneControlled[] would also break setMasterSetpoint's
+  // mapping to the control zone. So in that mode we just log the warning
+  // and keep serving the last-known-good temperature; the AMIB sees a
+  // stale-but-stable zone offset rather than a sudden NaN.
+  bool responderMode = controller()->getSlaveResponderEnabled();
+
   for (int i = 0; i < 8; i++) {
     if (last_temp_update_ms_[i] == 0) continue;  // never fed
     if (now - last_temp_update_ms_[i] < sensor_stale_timeout_ms_) continue;
     uint8_t zone = (uint8_t) (i + 1);
     if (controller()->getControlZone(zone)) {
-      ESP_LOGW(TAG, "Zone %u sensor stale (no POST for %lu ms); releasing wall-controller role",
-               zone, now - last_temp_update_ms_[i]);
-      controller()->setControlZone(zone, false);
+      if (responderMode) {
+        ESP_LOGW(TAG, "Zone %u sensor stale (no POST for %lu ms); keeping "
+                       "last-known-good temp because slave-3 responder is "
+                       "active (cannot release role).",
+                 zone, now - last_temp_update_ms_[i]);
+      } else {
+        ESP_LOGW(TAG, "Zone %u sensor stale (no POST for %lu ms); releasing "
+                       "wall-controller role",
+                 zone, now - last_temp_update_ms_[i]);
+        controller()->setControlZone(zone, false);
+      }
     }
     // Zero it so we don't keep firing. A fresh POST will re-arm.
     last_temp_update_ms_[i] = 0;
@@ -580,6 +596,10 @@ void Actron485ApiHandler::handleRequest(AsyncWebServerRequest *request) {
     handle_diagnostics_(request);
     return;
   }
+  if (method == HTTP_GET && url == "/api/v1/bus") {
+    handle_bus_(request);
+    return;
+  }
 
   if (method == HTTP_POST) {
     std::string body = read_body_(request);
@@ -701,6 +721,73 @@ void Actron485ApiHandler::handle_diagnostics_(AsyncWebServerRequest *request) {
     root["pending_main_commands"] = c->totalPendingMainCommands();
   }
   root["uptime_ms"] = (unsigned long) millis();
+
+  std::string out;
+  serializeJson(doc, out);
+  send_json_(request, 200, out);
+}
+
+// GET /api/v1/bus — Modbus register cache + slave-3 responder snapshot.
+// Cache is populated only when `logging_mode: DELTA` is set in actron.yaml,
+// because that's the path that runs printModbusMessage → updateRegisterCache.
+// In other logging modes the registers[] array will be empty. The responder
+// section reflects the live state of our slave-3 register buffer when
+// `act_as_slave_3: true` (independent of logging mode).
+//
+// Designed for debugging: lets you watch bus state via curl/jq without
+// grepping the ESPHome log, and confirms what the AMIB sees from us when
+// in slave-3 responder mode.
+void Actron485ApiHandler::handle_bus_(AsyncWebServerRequest *request) {
+  JsonDocument doc;
+  auto root = doc.to<JsonObject>();
+  auto *c = parent_->controller();
+  unsigned long now = (unsigned long) millis();
+
+  root["uptime_ms"] = now;
+  root["receiving_data"] = parent_->demo_mode() ? true : c->receivingData();
+
+  // Modbus register cache (sniffed bus traffic).
+  JsonArray regs = root["registers"].to<JsonArray>();
+  if (!parent_->demo_mode()) {
+    char hexAddr[8];
+    char hexVal[8];
+    for (size_t i = 0; i < c->getRegisterCacheCount(); i++) {
+      const auto &e = c->getRegisterCacheEntry(i);
+      JsonObject r = regs.add<JsonObject>();
+      r["slave"] = e.slave;
+      snprintf(hexAddr, sizeof(hexAddr), "0x%04X", e.address);
+      r["address"] = hexAddr;
+      snprintf(hexVal, sizeof(hexVal), "0x%04X", e.value);
+      r["value"] = hexVal;
+      r["age_ms"] = (now >= e.lastSeenMs) ? (now - e.lastSeenMs) : 0;
+    }
+  }
+
+  // Slave-responder mode state (what WE are publishing to the bus).
+  JsonObject responder = root["responder"].to<JsonObject>();
+  bool enabled = parent_->demo_mode() ? false : c->getSlaveResponderEnabled();
+  responder["enabled"] = enabled;
+  if (enabled) {
+    responder["slave_id"] = c->getSlaveResponderId();
+    JsonArray buffer = responder["buffer"].to<JsonArray>();
+    // Only the live region of the buffer is worth exposing — everything
+    // outside is unused inert RAM. Reg 0-12 (mode/fan/zones/setpoints),
+    // 21-28 (compressor PWM from AMIB writes), 30-33 (bounds), 100 (alive).
+    static const uint16_t kInterestingAddrs[] = {
+      0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+      21, 22, 23, 24, 25, 26, 27, 28,
+      30, 31, 32, 33,
+      100,
+    };
+    char hexVal[8];
+    for (uint16_t addr : kInterestingAddrs) {
+      uint16_t v = c->getSlaveRegister(addr);
+      JsonObject r = buffer.add<JsonObject>();
+      r["address"] = addr;
+      snprintf(hexVal, sizeof(hexVal), "0x%04X", v);
+      r["value"] = hexVal;
+    }
+  }
 
   std::string out;
   serializeJson(doc, out);
