@@ -1396,6 +1396,21 @@ namespace Actron485 {
                 zoneTemperature[z] = std::nan("");
             }
         }
+
+        // Seed stateMessage2 to match what renderSlave3State() will write to
+        // the wire. Without this, getFanSpeed() returns FanMode::Off (the
+        // in-class default) until the user explicitly POSTs to /api/v1/fan,
+        // even though we're already serving reg 3 lo = 0x00 = Esp/Auto on
+        // the bus — so the API would lie about the AC's actual behaviour.
+        //
+        // Only seed when stateMessage2 hasn't already been populated — e.g.
+        // by a persistence-layer restore from NVS that ran before
+        // setSlaveResponderMode (see Actron485Climate::load_slave3_state_).
+        if (!stateMessage2.initialised) {
+            stateMessage2.fanMode = FanMode::Esp;
+            stateMessage2.runningFanMode = FanMode::Off;
+            stateMessage2.initialised = true;
+        }
     }
 
     // Pack one zone's setpoint and observed temperature into the wire format
