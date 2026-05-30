@@ -1524,6 +1524,14 @@ namespace Actron485 {
 
     // Append CRC-16 (Modbus, poly 0xA001) to `frame` and transmit. Caller
     // sized `frame` to length+2.
+    //
+    // dataLastSentTime is intentionally NOT bumped here. That timestamp
+    // tracks "user command was just transmitted" — used by climate-entity
+    // update_status() to debounce state republishes after a command. In
+    // slave-responder mode every AMIB poll triggers a response from us, so
+    // bumping it would keep the climate entity perpetually inside its
+    // debounce window and the ESPHome web dashboard would never refresh.
+    // Bus-driven passive responses aren't user commands.
     void Controller::transmitModbusFrame(uint8_t *frame, uint8_t length) {
         if (_serial == nullptr) {
             return;
@@ -1537,7 +1545,6 @@ namespace Actron485 {
         _serial->write(frame, total);
         _serial->flush();
         serialWrite(false);
-        dataLastSentTime = platformMillis();
     }
 
     // System Control
