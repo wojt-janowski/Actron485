@@ -2,6 +2,7 @@
 
 #include "esphome/core/component.h"
 #include "esphome/core/automation.h"
+#include "esphome/core/preferences.h"
 #include "esphome/components/climate/climate.h"
 #include "esphome/core/defines.h"
 #include "esphome/components/uart/uart.h"
@@ -131,6 +132,43 @@ class Actron485Climate : public climate::Climate, public Component {
 
         // For debouncing
         unsigned long command_last_sent_ = 0;
+
+        // Slave-3 state persistence. NVS-backed snapshot of the controllable
+        // fields so a reboot restores whatever the API last set, instead of
+        // serving initSlave3Defaults' 22°C / Off / fan-Auto blank state to
+        // the AMIB and effectively yanking the AC off while we boot.
+        //
+        // Layout is locked behind a magic number and a layout version; if we
+        // ever change fields, bump kSlave3StateVersion so old blobs are
+        // discarded rather than mis-decoded.
+        static const uint32_t kSlave3StateMagic   = 0xAC773A02;
+        static const uint32_t kSlave3StateVersion = 1;
+        struct Slave3PersistedState {
+            uint32_t magic;
+            uint32_t version;
+            uint8_t operating_mode;   // Actron485::OperatingMode enum value
+            uint8_t fan_mode;         // Actron485::FanMode enum value
+            uint8_t continuous_fan;   // 0/1
+            uint8_t quiet_mode;       // 0/1
+            uint8_t zone_on_bitmap;   // bit N → zone (N+1) on
+            uint8_t _pad[3];          // align doubles
+            double  zone_setpoints[8];
+        } __attribute__((packed));
+
+        ESPPreferenceObject slave3_state_pref_;
+        Slave3PersistedState last_persisted_ = {};
+        unsigned long last_save_attempt_ms_ = 0;
+        bool slave3_persist_ready_ = false;
+
+        // Read NVS slot into stateMessage2 + zoneSetpoint[] BEFORE
+        // setSlaveResponderMode primes the buffer. Safe to call when no
+        // saved state exists — just leaves the controller's in-class defaults
+        // for initSlave3Defaults to fill in.
+        void load_slave3_state_();
+        // Snapshot the live state and persist if it diverges from the last
+        // saved snapshot. Throttled internally to once every ~5 s so a flurry
+        // of API writes doesn't burn flash wear.
+        void maybe_save_slave3_state_();
 
         /// Override control to change settings of the climate device.
         void control(const climate::ClimateCall &call) override;

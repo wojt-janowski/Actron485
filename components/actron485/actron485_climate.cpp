@@ -1,8 +1,12 @@
 #include "actron485_climate.h"
 #include "esphome/core/log.h"
+#include "esphome/core/helpers.h"
+#include "esphome/core/preferences.h"
 #include "utilities.h"
 #include "zone_fan.h"
 #include "zone_climate.h"
+
+#include <cstring>
 
 namespace esphome {
 namespace actron485 {
@@ -76,6 +80,11 @@ void Actron485Climate::setup() {
                        "on Modbus slave 3. Wall LCD data leads MUST be "
                        "disconnected from J6 DATA bus to avoid frame "
                        "collisions.");
+        // Restore last-known-good state from NVS BEFORE setSlaveResponderMode
+        // primes the buffer, so initSlave3Defaults' fallback values don't
+        // briefly clobber the restored state. initSlave3Defaults is
+        // load-aware: it only fills in zero / uninitialised fields.
+        load_slave3_state_();
         actron_controller.setSlaveResponderMode(3, true);
     }
     logStream_ = LogStream();
@@ -108,6 +117,9 @@ void Actron485Climate::loop() {
     if (now-counter > 1000) {
         counter = now;
         update_status();
+        if (act_as_slave_3_) {
+            maybe_save_slave3_state_();
+        }
     }
 }
 
@@ -269,6 +281,87 @@ void Actron485Climate::dump_config() {
   ESP_LOGCONFIG(TAG, "  Receiving Data: %s", actron_controller.receivingData() ? "YES" : "NO");
   ESP_LOGCONFIG(TAG, "  Act as Slave 3: %s", act_as_slave_3_ ? "YES" : "NO");
   this->dump_traits_(TAG);
+}
+
+void Actron485Climate::load_slave3_state_() {
+    // Stable hash for the preference slot. Bumping this key (or the layout
+    // version inside the blob) invalidates any previously-saved state on
+    // upgrade — desired when the persisted schema changes.
+    uint32_t hash = fnv1_hash(std::string("actron485_slave3_state_v1"));
+    slave3_state_pref_ = global_preferences->make_preference<Slave3PersistedState>(hash);
+    slave3_persist_ready_ = true;
+
+    Slave3PersistedState blob{};
+    if (!slave3_state_pref_.load(&blob)) {
+        ESP_LOGI(TAG, "No saved slave-3 state — initSlave3Defaults will seed.");
+        return;
+    }
+    if (blob.magic != kSlave3StateMagic || blob.version != kSlave3StateVersion) {
+        ESP_LOGW(TAG, "Saved slave-3 state has wrong magic/version "
+                       "(magic=0x%08X ver=%u); discarding.", blob.magic, blob.version);
+        return;
+    }
+
+    // Restore: directly populate the controller's typed state. We do this
+    // BEFORE setSlaveResponderMode runs initSlave3Defaults, which is
+    // load-aware (only fills in zero / uninitialised fields).
+    actron_controller.stateMessage2.operatingMode = (Actron485::OperatingMode) blob.operating_mode;
+    actron_controller.stateMessage2.fanMode       = (Actron485::FanMode) blob.fan_mode;
+    actron_controller.stateMessage2.continuousFan = blob.continuous_fan != 0;
+    actron_controller.stateMessage2.quietMode     = blob.quiet_mode != 0;
+    for (int z = 0; z < 8; z++) {
+        actron_controller.stateMessage2.zoneOn[z] = (blob.zone_on_bitmap & (1u << z)) != 0;
+        actron_controller.zoneSetpoint[z]         = blob.zone_setpoints[z];
+    }
+    actron_controller.stateMessage2.initialised = true;
+    last_persisted_ = blob;
+    ESP_LOGI(TAG, "Restored slave-3 state from NVS (mode=%u fan=%u zones=0x%02X)",
+             blob.operating_mode, blob.fan_mode, blob.zone_on_bitmap);
+}
+
+void Actron485Climate::maybe_save_slave3_state_() {
+    if (!slave3_persist_ready_) {
+        // load_slave3_state_() prepares the ESPPreferenceObject. If
+        // act_as_slave_3 is true we always run load first, so this branch
+        // only triggers when the flag flips at runtime — paranoia.
+        return;
+    }
+
+    // Throttle to once per ~5 s. NVS write cycles are bounded (~100k); a flurry
+    // of API setpoint nudges shouldn't burn the flash. The contents-equal
+    // short-circuit below is the real saver for typical use — this gate just
+    // bounds the worst case.
+    unsigned long now = millis();
+    if ((now - last_save_attempt_ms_) < 5000) {
+        return;
+    }
+    last_save_attempt_ms_ = now;
+
+    Slave3PersistedState cur{};
+    cur.magic   = kSlave3StateMagic;
+    cur.version = kSlave3StateVersion;
+    cur.operating_mode = (uint8_t) actron_controller.stateMessage2.operatingMode;
+    cur.fan_mode       = (uint8_t) actron_controller.stateMessage2.fanMode;
+    cur.continuous_fan = actron_controller.stateMessage2.continuousFan ? 1 : 0;
+    cur.quiet_mode     = actron_controller.stateMessage2.quietMode     ? 1 : 0;
+    uint8_t bitmap = 0;
+    for (int z = 0; z < 8; z++) {
+        if (actron_controller.stateMessage2.zoneOn[z]) bitmap |= uint8_t(1 << z);
+        cur.zone_setpoints[z] = actron_controller.zoneSetpoint[z];
+    }
+    cur.zone_on_bitmap = bitmap;
+
+    if (memcmp(&cur, &last_persisted_, sizeof(cur)) == 0) {
+        // No change since last save — skip.
+        return;
+    }
+    if (!slave3_state_pref_.save(&cur)) {
+        ESP_LOGW(TAG, "Slave-3 state save failed");
+        return;
+    }
+    last_persisted_ = cur;
+    ESP_LOGD(TAG, "Persisted slave-3 state (mode=%u fan=%u zones=0x%02X)",
+             cur.operating_mode, cur.fan_mode, cur.zone_on_bitmap);
 }
 
 }
