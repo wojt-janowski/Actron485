@@ -1481,17 +1481,24 @@ namespace Actron485 {
         }
         _slaveRegisters[2] = (uint16_t(reg2Hi) << 8) | reg2Lo;
 
-        // Reg 3: high byte = zone-enable bitmap (zone N → bit N-1); low byte
-        // = fan speed. Continuous fan is bit 2 of the high byte, which
-        // collides with zone 3 in the bitmap — until we have a cleaner
-        // separation, prefer zone state and accept that continuous fan won't
-        // round-trip when zone 3 is on. See PROTOCOL_NOTES Phase 3A2.
+        // Reg 3: high byte = status flags, low byte = fan speed.
+        //
+        // Decoded from LCD probes on 2026-05-30 (PROTOCOL_NOTES.md "Reg 3 hi
+        // status flags"):
+        //   bit 0 = system armed (set whenever any zone is enabled)
+        //   bit 1 = fan running (set transiently when fan is spinning)
+        //   bit 2 = continuous fan flag
+        //   bit 3 = unknown — set in Heat-armed states regardless of fan
+        //           speed or continuous-fan setting; safe to leave 0 from us.
+        // The earlier hypothesis that the high byte is a zone bitmap was
+        // wrong: zones live in reg 4 hi (see below).
         uint8_t reg3Hi = 0x00;
+        bool anyZoneOn = false;
         for (int z = 0; z < 8; z++) {
-            if (stateMessage2.zoneOn[z]) {
-                reg3Hi |= uint8_t(1 << z);
-            }
+            if (stateMessage2.zoneOn[z]) { anyZoneOn = true; break; }
         }
+        if (anyZoneOn)                  reg3Hi |= 0x01;  // system armed
+        if (stateMessage2.continuousFan) reg3Hi |= 0x04;  // continuous fan
         uint8_t reg3Lo;
         switch (stateMessage2.fanMode) {
             case FanMode::Low:
@@ -1506,11 +1513,18 @@ namespace Actron485 {
         }
         _slaveRegisters[3] = (uint16_t(reg3Hi) << 8) | reg3Lo;
 
-        // Reg 4: bit 1 of the high byte = system-on. Low byte is a constant
-        // 0x23 — never observed varying across the captured off/on transitions.
-        bool systemOn = mode != OperatingMode::Off && mode != OperatingMode::OffAuto
-            && mode != OperatingMode::OffCool && mode != OperatingMode::OffHeat;
-        _slaveRegisters[4] = systemOn ? 0x0223 : 0x0023;
+        // Reg 4: high byte = zone-enable bitmap (zone N → bit N-1); low byte
+        // = constant 0x23. The zone bitmap doubles as the system-on signal —
+        // when zoneBitmap == 0x00 the AMIB treats the AC as off, no matter
+        // what reg 2 hi says. The earlier "bit 1 = system on" reading was a
+        // misinterpretation: bit 1 just happened to be zone 2, which the
+        // AMIB defaulted to whenever we asked for "system on" without
+        // specifying a zone. Decoded from LCD probes on 2026-05-30.
+        uint8_t zoneBitmap = 0x00;
+        for (int z = 0; z < 8; z++) {
+            if (stateMessage2.zoneOn[z]) zoneBitmap |= uint8_t(1 << z);
+        }
+        _slaveRegisters[4] = (uint16_t(zoneBitmap) << 8) | 0x23;
 
         // Regs 5-12: one per zone. Setpoint comes from zoneSetpoint[]
         // (driven by setZoneSetpointTemperatureCustom + setMasterSetpoint),
@@ -1589,13 +1603,32 @@ namespace Actron485 {
         // next ~6s poll cycle bounces our own response back to us.
         if (_slaveResponderEnabled && _slaveResponderId == 3) {
             stateMessage2.initialised = true;
-            // Collapse the Off* variants to plain Off for the renderer —
-            // reg 4 hi bit 1 is the only system-on signal on the wire.
-            if (nextMode == OperatingMode::OffAuto || nextMode == OperatingMode::OffCool
-                || nextMode == OperatingMode::OffHeat) {
-                stateMessage2.operatingMode = OperatingMode::Off;
-            } else {
-                stateMessage2.operatingMode = nextMode;
+            // Collapse the Off* variants to plain Off for the renderer.
+            bool goingActive = (nextMode != OperatingMode::Off
+                && nextMode != OperatingMode::OffAuto
+                && nextMode != OperatingMode::OffCool
+                && nextMode != OperatingMode::OffHeat);
+            stateMessage2.operatingMode = goingActive ? nextMode : OperatingMode::Off;
+
+            // When transitioning to an active mode, the AMIB needs a
+            // non-zero zone bitmap in reg 4 hi or it treats the AC as off.
+            // If the user hasn't selected any zone, enable the first one we
+            // own (via setControlZone), or fall back to zone 1 — mirrors the
+            // wall LCD's behaviour of keeping at least one zone armed
+            // whenever the system is running.
+            if (goingActive) {
+                bool anyZone = false;
+                for (int z = 0; z < 8; z++) {
+                    if (stateMessage2.zoneOn[z]) { anyZone = true; break; }
+                }
+                if (!anyZone) {
+                    int fallback = -1;
+                    for (int z = 0; z < 8; z++) {
+                        if (zoneControlled[z]) { fallback = z; break; }
+                    }
+                    if (fallback < 0) fallback = 0;  // zone 1
+                    stateMessage2.zoneOn[fallback] = true;
+                }
             }
             renderSlave3State();
         }
@@ -1743,6 +1776,22 @@ namespace Actron485 {
         if (_slaveResponderEnabled && _slaveResponderId == 3) {
             stateMessage2.initialised = true;
             stateMessage2.operatingMode = mode;
+            // Going active with no zones enabled would write a zero zone
+            // bitmap to reg 4 hi, which the AMIB treats as "system off".
+            // Auto-enable a controlled zone (or zone 1) to keep the request
+            // meaningful. See setSystemOn() for the same logic.
+            bool anyZone = false;
+            for (int z = 0; z < 8; z++) {
+                if (stateMessage2.zoneOn[z]) { anyZone = true; break; }
+            }
+            if (!anyZone) {
+                int fallback = -1;
+                for (int z = 0; z < 8; z++) {
+                    if (zoneControlled[z]) { fallback = z; break; }
+                }
+                if (fallback < 0) fallback = 0;
+                stateMessage2.zoneOn[fallback] = true;
+            }
             renderSlave3State();
         }
     }
