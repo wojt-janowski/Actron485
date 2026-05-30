@@ -1292,6 +1292,16 @@ namespace Actron485 {
         return (platformMillis() - dataLastReceivedTime) < 3000;
     }
 
+    // In slave-responder mode, the setter `receivingData()` guards become
+    // architecturally wrong — we ARE the bus's authoritative slave-3
+    // responder. A transient ≥3s lull in master polls (e.g. cable glitch,
+    // AMIB restart) shouldn't silently swallow a user's power-off or
+    // setpoint command. Use this helper for setter preconditions instead
+    // of `receivingData()` directly.
+    bool Controller::allowControlCommand() {
+        return _slaveResponderEnabled || receivingData();
+    }
+
     // Setup
 
     void Controller::setControlZone(uint8_t zone, bool control) {
@@ -1367,6 +1377,13 @@ namespace Actron485 {
             uint16_t value = _slaveRegisters[startAddr + i];
             frame[3 + i * 2] = uint8_t(value >> 8);
             frame[3 + i * 2 + 1] = uint8_t(value & 0xFF);
+            // Mirror the transmitted values into the (slave, address) cache
+            // that /api/v1/bus reads. RS485 half-duplex means our own TX
+            // doesn't loop back through processModbusFrame/captureFrameRegisters,
+            // so without this the bus snapshot would be missing every slave-3
+            // register the AMIB has read from us — exactly the data we'd
+            // want when debugging the responder.
+            updateRegisterCache(_slaveResponderId, startAddr + i, value);
         }
         transmitModbusFrame(frame, frameLen);
     }
@@ -1567,7 +1584,7 @@ namespace Actron485 {
     // System Control
 
     void Controller::setSystemOn(bool on) {
-        if (!receivingData()) {
+        if (!allowControlCommand()) {
             return;
         }
 
@@ -1632,6 +1649,16 @@ namespace Actron485 {
                     if (fallback < 0) fallback = 0;  // zone 1
                     stateMessage2.zoneOn[fallback] = true;
                 }
+            } else {
+                // Power-off: clear the zone bitmap so reg 4 hi goes to 0.
+                // Leaving zoneOn[] set would publish "Off mode with zones
+                // armed" — an undocumented state the AMIB has never been
+                // observed in, and which gets persisted to NVS surviving
+                // reboots. Restore the zones on the next active-mode call
+                // via the fallback above.
+                for (int z = 0; z < 8; z++) {
+                    stateMessage2.zoneOn[z] = false;
+                }
             }
             renderSlave3State();
         }
@@ -1655,7 +1682,7 @@ namespace Actron485 {
     }
 
     void Controller::setFanSpeed(FanMode fanSpeed) {
-        if (!receivingData()) {
+        if (!allowControlCommand()) {
             return;
         }
 
@@ -1702,7 +1729,7 @@ namespace Actron485 {
     }
 
     void Controller::setFanSpeedAbsolute(FanMode fanSpeed) {
-        if (!receivingData()) {
+        if (!allowControlCommand()) {
             return;
         }
 
@@ -1721,7 +1748,7 @@ namespace Actron485 {
     }
 
     void Controller::setContinuousFanMode(bool on) {
-        if (!receivingData()) {
+        if (!allowControlCommand()) {
             return;
         }
 
@@ -1763,8 +1790,25 @@ namespace Actron485 {
         return false;
     }
 
+    void Controller::setQuietMode(bool on) {
+        if (!allowControlCommand()) {
+            return;
+        }
+        // Legacy bus has no documented command path for quiet mode, so the
+        // setter is only meaningful in slave-3 responder mode. Outside it
+        // we still update stateMessage2 so the API/HA round-trip works for
+        // testing in demo mode, but no register is touched.
+        if (_slaveResponderEnabled && _slaveResponderId == 3) {
+            stateMessage2.initialised = true;
+            stateMessage2.quietMode = on;
+            renderSlave3State();
+        } else {
+            stateMessage2.quietMode = on;
+        }
+    }
+
     void Controller::setOperatingMode(OperatingMode mode) {
-        if (!receivingData()) {
+        if (!allowControlCommand()) {
             return;
         }
 
@@ -1811,7 +1855,7 @@ namespace Actron485 {
     }
 
     void Controller::setMasterSetpoint(double temperature) {
-        if (!receivingData()) {
+        if (!allowControlCommand()) {
             return;
         }
 
@@ -1881,7 +1925,7 @@ namespace Actron485 {
     /// Zone Control
 
     void Controller::setZoneOn(uint8_t zone, bool on) {
-        if (!receivingData()) {
+        if (!allowControlCommand()) {
             return;
         }
 
@@ -1917,7 +1961,7 @@ namespace Actron485 {
     }
 
     void Controller::setZoneSetpointTemperatureCustom(uint8_t zone, double temperature, bool adjustMaster) {
-        if (!receivingData()) {
+        if (!allowControlCommand()) {
             return;
         }
 
@@ -1958,12 +2002,20 @@ namespace Actron485 {
         }
 
         if (_slaveResponderEnabled && _slaveResponderId == 3) {
+            // Keep stateMessage2.setpoint in sync with the control zone's
+            // setpoint so the ESPHome climate entity and /api/v1/state.setpoint
+            // don't lag the wire value. Master setpoint IS the control
+            // zone's setpoint by design — see PROTOCOL_NOTES.md.
+            if (zoneControlled[zindex(zone)]) {
+                stateMessage2.initialised = true;
+                stateMessage2.setpoint = temperature;
+            }
             renderSlave3State();
         }
     }
 
     void Controller::setZoneSetpointTemperature(uint8_t zone, double temperature, bool adjustMaster) {
-        if (!receivingData()) {
+        if (!allowControlCommand()) {
             return;
         }
         

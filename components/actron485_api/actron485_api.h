@@ -52,6 +52,7 @@ class Actron485Api : public Component {
   void apply_operating_mode(Actron485::OperatingMode mode);
   void apply_fan_speed(Actron485::FanMode mode);
   void apply_continuous_fan(bool on);
+  void apply_quiet_mode(bool on);
   void apply_master_setpoint(double temperature);
   void apply_zone_on(uint8_t zone, bool on);
   void apply_zone_setpoint(uint8_t zone, double temperature);
@@ -137,6 +138,7 @@ class Actron485ApiHandler : public AsyncWebHandler {
   void handle_power_(AsyncWebServerRequest *request, const std::string &body);
   void handle_mode_(AsyncWebServerRequest *request, const std::string &body);
   void handle_fan_(AsyncWebServerRequest *request, const std::string &body);
+  void handle_quiet_(AsyncWebServerRequest *request, const std::string &body);
   void handle_setpoint_(AsyncWebServerRequest *request, const std::string &body);
   void handle_zone_(AsyncWebServerRequest *request, int zone, const std::string &body);
   void handle_zone_control_(AsyncWebServerRequest *request, int zone, const std::string &body);

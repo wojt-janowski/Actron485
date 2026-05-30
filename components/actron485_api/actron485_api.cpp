@@ -195,6 +195,12 @@ void Actron485Api::apply_continuous_fan(bool on) {
   if (demo_mode_) { demo_continuous_fan_ = on; return; }
   controller()->setContinuousFanMode(on);
 }
+void Actron485Api::apply_quiet_mode(bool on) {
+  // Demo mode doesn't simulate quiet (the demo simulator only cares about
+  // mode/setpoint/fan); silently no-op so the API call still succeeds.
+  if (demo_mode_) { return; }
+  controller()->setQuietMode(on);
+}
 void Actron485Api::apply_master_setpoint(double temperature) {
   if (demo_mode_) { demo_setpoint_ = (float) temperature; return; }
   controller()->setMasterSetpoint(temperature);
@@ -606,6 +612,7 @@ void Actron485ApiHandler::handleRequest(AsyncWebServerRequest *request) {
     if (url == "/api/v1/power") { handle_power_(request, body); return; }
     if (url == "/api/v1/mode") { handle_mode_(request, body); return; }
     if (url == "/api/v1/fan") { handle_fan_(request, body); return; }
+    if (url == "/api/v1/quiet") { handle_quiet_(request, body); return; }
     if (url == "/api/v1/setpoint") { handle_setpoint_(request, body); return; }
     if (url == "/api/v1/demo") { handle_demo_(request, body); return; }
 
@@ -824,6 +831,18 @@ void Actron485ApiHandler::handle_fan_(AsyncWebServerRequest *request, const std:
   if (doc["continuous"].is<bool>()) {
     parent_->apply_continuous_fan(doc["continuous"].as<bool>());
   }
+  send_json_(request, 202, "{\"status\":\"queued\"}");
+}
+
+// POST /api/v1/quiet  {"on": bool}
+// Toggles the AC's quiet (low-noise compressor) profile. Encoded as bit 7
+// of slave-3 reg 2 hi. Only meaningful in slave-3 responder mode; in
+// legacy bus mode the setter no-ops (no documented command path).
+void Actron485ApiHandler::handle_quiet_(AsyncWebServerRequest *request, const std::string &body) {
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) { send_error_(request, 400, "invalid_json"); return; }
+  if (!doc["on"].is<bool>()) { send_error_(request, 400, "missing_on"); return; }
+  parent_->apply_quiet_mode(doc["on"].as<bool>());
   send_json_(request, 202, "{\"status\":\"queued\"}");
 }
 

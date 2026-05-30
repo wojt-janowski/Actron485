@@ -324,6 +324,13 @@ public:
     /// @return true if we are receiving fresh data, false otherwise
     bool receivingData();
 
+    /// @brief Whether the controller should accept a setter command right
+    /// now. In normal operation this requires fresh bus traffic
+    /// (`receivingData()`); in slave-3 responder mode it always returns true
+    /// because WE are the bus's authoritative responder and a transient
+    /// master polling lull shouldn't silently drop user commands.
+    bool allowControlCommand();
+
     /// @brief Number of commands that are pending to send, including zones (Ultima only)
     /// @return commands to be sent
     uint8_t totalPendingCommands();
@@ -423,6 +430,12 @@ public:
     /// @brief get if quiet mode (low-noise compressor profile) is on
     /// @returns true if on, false otherwise
     bool getQuietMode();
+
+    /// @brief set quiet mode (low-noise compressor profile) on or off.
+    /// Encoded as bit 7 of slave-3 reg 2 hi byte. No-op outside slave-3
+    /// responder mode (legacy bus has no command path for this).
+    /// @param on true to enable quiet mode, false to disable
+    void setQuietMode(bool on);
 
     /// @brief adjusts the operating mode of the system, can also be used to turn off the system
     /// turning off will try to preserve the state
