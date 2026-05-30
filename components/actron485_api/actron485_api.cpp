@@ -96,6 +96,7 @@ void Actron485Api::setup() {
   handler_ = new Actron485ApiHandler(this);
   base->add_handler(handler_);
   this->load_zone_names_();
+  this->load_settings_();
   ESP_LOGCONFIG(TAG, "Actron485 API mounted at /api/v1/* on port %u", base->get_port());
 }
 
@@ -124,6 +125,125 @@ void Actron485Api::save_zone_names_() {
   }
   zone_names_pref_.save(&blob);
   global_preferences->sync();
+}
+
+void Actron485Api::load_settings_() {
+  uint32_t hash = fnv1_hash(std::string("actron485_api_settings_v1"));
+  settings_pref_ = global_preferences->make_preference<SettingsBlob>(hash);
+  settings_loaded_ = true;
+
+  // Seed the settings cache from the current live state so GET /settings
+  // reflects the actual yaml-time config before any NVS override is
+  // applied. Without this, the cache shows the in-class defaults
+  // (false / 1) until the user issues a PATCH — which is misleading.
+  if (climate_ && climate_->get_controller()) {
+    auto *c = climate_->get_controller();
+    settings_act_as_slave_3_ = c->getSlaveResponderEnabled() && c->getSlaveResponderId() == 3;
+    settings_logging_mode_ = (int) c->printOutMode;
+  }
+
+  SettingsBlob blob{};
+  if (!settings_pref_.load(&blob)) {
+    ESP_LOGCONFIG(TAG, "  No saved runtime settings — using yaml defaults "
+                       "(act_as_slave_3=%s log_mode=%d)",
+                  settings_act_as_slave_3_ ? "on" : "off", settings_logging_mode_);
+    return;
+  }
+  if (blob.magic != kSettingsMagic || blob.version != kSettingsVersion) {
+    ESP_LOGW(TAG, "  Saved settings have wrong magic/version (0x%08X v%u); discarding",
+             blob.magic, blob.version);
+    return;
+  }
+  // Apply persisted overrides on top of yaml-time defaults.
+  if (blob.has_api_key) {
+    blob.api_key[API_KEY_MAX] = '\0';  // defensive
+    auth_token_ = std::string(blob.api_key);
+    ESP_LOGCONFIG(TAG, "  Loaded API key from NVS (override yaml)");
+  }
+  settings_act_as_slave_3_ = blob.act_as_slave_3 != 0;
+  settings_logging_mode_   = blob.logging_mode;
+  // Push into the live controller. printOutMode is a public enum field.
+  if (climate_) {
+    auto *c = climate_->get_controller();
+    if (c) {
+      c->setSlaveResponderMode(3, settings_act_as_slave_3_);
+      // Map int to PrintOutMode enum. Out-of-range falls back to ChangedMessages.
+      switch (settings_logging_mode_) {
+        case 1: c->printOutMode = Actron485::PrintOutMode::StatusOnly; break;
+        case 2: c->printOutMode = Actron485::PrintOutMode::ChangedMessages; break;
+        case 3: c->printOutMode = Actron485::PrintOutMode::AllMessages; break;
+        case 4: c->printOutMode = Actron485::PrintOutMode::CorrelationCapture; break;
+        case 5: c->printOutMode = Actron485::PrintOutMode::RegisterDelta; break;
+        default: c->printOutMode = Actron485::PrintOutMode::ChangedMessages; break;
+      }
+    }
+  }
+  ESP_LOGCONFIG(TAG, "  Loaded settings: act_as_slave_3=%s log_mode=%d api_key=%s",
+                settings_act_as_slave_3_ ? "on" : "off", settings_logging_mode_,
+                blob.has_api_key ? "set" : "unset");
+}
+
+void Actron485Api::save_settings_() {
+  if (!settings_loaded_) return;
+  SettingsBlob blob{};
+  blob.magic = kSettingsMagic;
+  blob.version = kSettingsVersion;
+  blob.act_as_slave_3 = settings_act_as_slave_3_ ? 1 : 0;
+  blob.logging_mode = (uint8_t) settings_logging_mode_;
+  blob.has_api_key = auth_token_.empty() ? 0 : 1;
+  size_t n = std::min(auth_token_.size(), API_KEY_MAX);
+  memcpy(blob.api_key, auth_token_.data(), n);
+  blob.api_key[n] = '\0';
+  settings_pref_.save(&blob);
+  global_preferences->sync();
+}
+
+void Actron485Api::set_api_key_runtime(const std::string &key) {
+  auth_token_ = key;
+  this->save_settings_();
+  ESP_LOGI(TAG, "API key %s", key.empty() ? "cleared (auth disabled)" : "updated");
+}
+
+void Actron485Api::set_act_as_slave_3_runtime(bool on) {
+  settings_act_as_slave_3_ = on;
+  if (climate_ && climate_->get_controller()) {
+    climate_->get_controller()->setSlaveResponderMode(3, on);
+  }
+  this->save_settings_();
+  ESP_LOGW(TAG, "act_as_slave_3 runtime-toggled %s — wall LCD data leads MUST be "
+                "physically disconnected when ON; collision risk if both are live",
+           on ? "ON" : "OFF");
+}
+
+void Actron485Api::set_logging_mode_runtime(int mode) {
+  if (mode < 0 || mode > 5) return;
+  settings_logging_mode_ = mode;
+  if (climate_ && climate_->get_controller()) {
+    auto *c = climate_->get_controller();
+    switch (mode) {
+      case 0: /* nothing — disable */                                   break;
+      case 1: c->printOutMode = Actron485::PrintOutMode::StatusOnly;       break;
+      case 2: c->printOutMode = Actron485::PrintOutMode::ChangedMessages;  break;
+      case 3: c->printOutMode = Actron485::PrintOutMode::AllMessages;      break;
+      case 4: c->printOutMode = Actron485::PrintOutMode::CorrelationCapture; break;
+      case 5: c->printOutMode = Actron485::PrintOutMode::RegisterDelta;    break;
+    }
+  }
+  this->save_settings_();
+}
+
+std::string Actron485Api::build_settings_json() {
+  JsonDocument doc;
+  auto root = doc.to<JsonObject>();
+  root["act_as_slave_3"] = settings_act_as_slave_3_;
+  root["logging_mode"] = settings_logging_mode_;
+  // api_key is masked in the response — never echo back the real value.
+  // Clients that need to verify they hold the right key should just
+  // attempt an authenticated request and check for a 200.
+  root["api_key_set"] = !auth_token_.empty();
+  std::string out;
+  serializeJson(doc, out);
+  return out;
 }
 
 std::string Actron485Api::get_zone_display_name(int zone) {
@@ -371,6 +491,12 @@ void Actron485Api::demo_tick_() {
   }
 }
 
+void Actron485Api::note_zone_humidity_update(uint8_t zone, float humidity) {
+  if (zone < 1 || zone > 8) return;
+  zone_humidity_[zone - 1] = humidity;
+  last_humidity_update_ms_[zone - 1] = millis();
+}
+
 void Actron485Api::note_zone_temperature_update(uint8_t zone) {
   if (zone < 1 || zone > 8) return;
   last_temp_update_ms_[zone - 1] = millis();
@@ -495,6 +621,15 @@ std::string Actron485Api::build_state_json() {
         z["setpoint"] = c->getZoneSetpointTemperature(i);
         z["current_temperature"] = c->getZoneCurrentTemperature(i);
       }
+      // Humidity is independent of Ultima — it's just an external
+      // sensor relay through /api/v1/zones/{n}/humidity. Surface NaN
+      // as null so clients can cleanly render "—".
+      float h = this->zone_humidity((uint8_t) i);
+      if (std::isfinite(h)) {
+        z["humidity"] = h;
+      } else {
+        z["humidity"] = nullptr;
+      }
     }
   }
 
@@ -589,15 +724,21 @@ void Actron485ApiHandler::handleRequest(AsyncWebServerRequest *request) {
     return;
   }
 
-  if (!authorized_(request)) {
-    send_error_(request, 401, "unauthorized");
-    return;
-  }
-
   char url_buf[AsyncWebServerRequest::URL_BUF_SIZE];
   auto url_ref = request->url_to(url_buf);
   std::string url(url_ref);
   http_method method = request->method();
+
+  // /api/v1/info is intentionally unauthenticated — it carries only
+  // public discovery info (device name, api version, zone metadata,
+  // build time) and is the endpoint sensors / mobile apps poll before
+  // they hold a token. Everything else requires auth when api_key is
+  // configured.
+  bool auth_exempt = (method == HTTP_GET && url == "/api/v1/info");
+  if (!auth_exempt && !authorized_(request)) {
+    send_error_(request, 401, "unauthorized");
+    return;
+  }
 
   if (method == HTTP_GET && url == "/api/v1/info") {
     handle_info_(request);
@@ -613,6 +754,15 @@ void Actron485ApiHandler::handleRequest(AsyncWebServerRequest *request) {
   }
   if (method == HTTP_GET && url == "/api/v1/bus") {
     handle_bus_(request);
+    return;
+  }
+  if (method == HTTP_GET && url == "/api/v1/settings") {
+    handle_settings_get_(request);
+    return;
+  }
+  if (method == HTTP_POST && url == "/api/v1/settings") {
+    std::string body = read_body_(request);
+    handle_settings_patch_(request, body);
     return;
   }
 
@@ -645,6 +795,10 @@ void Actron485ApiHandler::handleRequest(AsyncWebServerRequest *request) {
       }
       if (subpath == "temperature") {
         handle_zone_temperature_(request, zone, body);
+        return;
+      }
+      if (subpath == "humidity") {
+        handle_zone_humidity_(request, zone, body);
         return;
       }
       if (subpath == "name") {
@@ -948,6 +1102,64 @@ void Actron485ApiHandler::handle_zone_name_(AsyncWebServerRequest *request, int 
   std::string body_out;
   serializeJson(resp, body_out);
   send_json_(request, 200, body_out);
+}
+
+// POST /api/v1/zones/{n}/humidity  {"humidity": <%>}
+// Per-zone relative humidity from an external sensor. The Actron bus
+// doesn't carry per-zone humidity (slave 1 has some floats but they're
+// AC-head side, not zone-level), so we just relay the most recent value
+// through /api/v1/state for clients to consume. Plausibility bounds
+// 0-100 %RH; rejects on parse failure. Returns 200 with the stored
+// value because it's local state, not an RS485 command.
+void Actron485ApiHandler::handle_zone_humidity_(AsyncWebServerRequest *request, int zone, const std::string &body) {
+  if (zone < 1 || zone > 8) { send_error_(request, 400, "invalid_zone"); return; }
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) { send_error_(request, 400, "invalid_json"); return; }
+  if (!doc["humidity"].is<float>() && !doc["humidity"].is<double>() && !doc["humidity"].is<int>()) {
+    send_error_(request, 400, "missing_humidity"); return;
+  }
+  double h = doc["humidity"].as<double>();
+  if (h < 0.0 || h > 100.0) { send_error_(request, 400, "humidity_out_of_range"); return; }
+  parent_->note_zone_humidity_update((uint8_t) zone, (float) h);
+  JsonDocument resp;
+  resp["number"] = zone;
+  resp["humidity"] = h;
+  std::string body_out;
+  serializeJson(resp, body_out);
+  send_json_(request, 200, body_out);
+}
+
+// GET /api/v1/settings — current runtime-mutable settings.
+// api_key value is never echoed; only the set/unset flag.
+void Actron485ApiHandler::handle_settings_get_(AsyncWebServerRequest *request) {
+  send_json_(request, 200, parent_->build_settings_json());
+}
+
+// PATCH /api/v1/settings — partial update. Any field absent from the
+// body is left unchanged. Fields:
+//   - api_key (string): set the bearer token. Empty string disables auth.
+//   - act_as_slave_3 (bool): enable/disable slave-3 takeover at runtime.
+//     SAFETY: when toggling ON, the wall LCD's data leads must already
+//     be physically disconnected from the J6 DATA bus — otherwise
+//     two devices respond to slave-3 polls and the AMIB sees corrupted
+//     frames. Caller's responsibility.
+//   - logging_mode (int 0..5): 1=STATUS, 2=CHANGE, 3=ALL, 4=CAPTURE, 5=DELTA.
+// Returns the updated settings (with api_key still masked).
+void Actron485ApiHandler::handle_settings_patch_(AsyncWebServerRequest *request, const std::string &body) {
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) { send_error_(request, 400, "invalid_json"); return; }
+  if (doc["api_key"].is<const char *>()) {
+    parent_->set_api_key_runtime(doc["api_key"].as<const char *>());
+  }
+  if (doc["act_as_slave_3"].is<bool>()) {
+    parent_->set_act_as_slave_3_runtime(doc["act_as_slave_3"].as<bool>());
+  }
+  if (doc["logging_mode"].is<int>()) {
+    int m = doc["logging_mode"].as<int>();
+    if (m < 0 || m > 5) { send_error_(request, 400, "invalid_logging_mode"); return; }
+    parent_->set_logging_mode_runtime(m);
+  }
+  send_json_(request, 200, parent_->build_settings_json());
 }
 
 }  // namespace actron485_api

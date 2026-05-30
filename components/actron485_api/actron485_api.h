@@ -38,6 +38,19 @@ class Actron485Api : public Component {
   // out of range or the name is too long.
   bool set_zone_name_override(uint8_t zone, const std::string &name);
 
+  // ---- Runtime-mutable settings (PATCH /api/v1/settings) ----
+  // Each of these persists to NVS so it survives reboots. They override
+  // whatever was set at compile-time in actron.yaml, on the principle
+  // that the most recent user instruction wins (yaml is the factory
+  // default; runtime overrides via the API stick). Pass empty string
+  // to set_api_key_runtime("") to clear the key (auth disabled).
+  void set_api_key_runtime(const std::string &key);
+  void set_act_as_slave_3_runtime(bool on);
+  void set_logging_mode_runtime(int mode);
+  // Snapshot of currently-effective settings for GET /api/v1/settings.
+  // api_key is returned masked ("***" if set, "" if not).
+  std::string build_settings_json();
+
   Actron485::Controller *controller() { return climate_->get_controller(); }
   actron485::Actron485Climate *climate() { return climate_; }
   const std::string &auth_token() const { return auth_token_; }
@@ -72,6 +85,20 @@ class Actron485Api : public Component {
   uint32_t sensor_stale_timeout_ms_{600000};
   unsigned long last_temp_update_ms_[8]{};
   unsigned long last_stale_check_ms_{0};
+
+  // Per-zone humidity from external sensors (POST .../humidity). The AC
+  // bus doesn't carry per-zone humidity; we just relay the most recent
+  // POSTed value through /api/v1/state for clients to consume. NaN
+  // means "no reading received yet" — clients should render that as
+  // "—" or hide the field.
+  float zone_humidity_[8]{NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN};
+  unsigned long last_humidity_update_ms_[8]{};
+ public:
+  void note_zone_humidity_update(uint8_t zone, float humidity);
+  float zone_humidity(uint8_t zone) const {
+    return (zone >= 1 && zone <= 8) ? zone_humidity_[zone - 1] : NAN;
+  }
+ protected:
 
   // ---- Demo-mode simulation state ----
   // Only used when demo_mode_ is true. On a real device these are all
@@ -110,6 +137,34 @@ class Actron485Api : public Component {
   ESPPreferenceObject zone_names_pref_;
   void load_zone_names_();
   void save_zone_names_();
+
+  // Runtime-mutable settings persisted alongside zone names. yaml sets
+  // factory defaults at compile time; any NVS-stored value takes
+  // precedence at boot. PATCH /api/v1/settings writes through both
+  // the live state and the NVS slot.
+  //
+  // act_as_slave_3_runtime_ / logging_mode_runtime_ are tri-state: -1
+  // means "no override, use yaml". 0/1/2/... are the active values.
+  static constexpr uint32_t kSettingsMagic   = 0xAC773501;
+  static constexpr uint32_t kSettingsVersion = 1;
+  static constexpr size_t   API_KEY_MAX     = 63;
+  struct SettingsBlob {
+    uint32_t magic;
+    uint32_t version;
+    uint8_t  act_as_slave_3;       // 0=off, 1=on
+    uint8_t  logging_mode;         // 0..5 — same enum as yaml `logging_mode`
+    uint8_t  has_api_key;          // 0=none, 1=use api_key field
+    uint8_t  _pad;
+    char     api_key[API_KEY_MAX + 1];
+  } __attribute__((packed));
+  ESPPreferenceObject settings_pref_;
+  bool settings_loaded_{false};
+  // Cached for fast PATCH echoes; sourced from NVS at boot (or yaml
+  // fallback if NVS is empty).
+  bool settings_act_as_slave_3_{false};
+  int  settings_logging_mode_{1};  // 1 = STATUS, ESPHome default
+  void load_settings_();
+  void save_settings_();
 };
 
 class Actron485ApiHandler : public AsyncWebHandler {
@@ -143,7 +198,10 @@ class Actron485ApiHandler : public AsyncWebHandler {
   void handle_zone_(AsyncWebServerRequest *request, int zone, const std::string &body);
   void handle_zone_control_(AsyncWebServerRequest *request, int zone, const std::string &body);
   void handle_zone_temperature_(AsyncWebServerRequest *request, int zone, const std::string &body);
+  void handle_zone_humidity_(AsyncWebServerRequest *request, int zone, const std::string &body);
   void handle_zone_name_(AsyncWebServerRequest *request, int zone, const std::string &body);
+  void handle_settings_get_(AsyncWebServerRequest *request);
+  void handle_settings_patch_(AsyncWebServerRequest *request, const std::string &body);
 };
 
 }  // namespace actron485_api
