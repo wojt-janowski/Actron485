@@ -157,11 +157,19 @@ async def to_code(config):
 
             fanConfig = fan.fan_schema(Actron485ZoneFan)(zone_f)
             fanConfig[CONF_ID] = fan_id
-            
+
             zoneFan = cg.new_Pvariable(fanConfig[CONF_ID])
             await fan.register_fan(zoneFan, fanConfig)
             await cg.register_component(zoneFan, fanConfig)
             cg.add(var.add_zone(number, zoneFan))
+            # When Ultima is available, the per-zone Climate entity owns
+            # the dashboard UI (power icon + setpoint slider). The redundant
+            # Fan-only entity is hidden from API/web so each zone shows
+            # exactly one control instead of duplicated entries. The C++
+            # object stays in place because actron485_api reads zone state
+            # via climate_->get_zone_fan() for the /api/v1/state output.
+            if has_ultima:
+                cg.add(zoneFan.set_internal(True))
 
             if has_ultima:
                 zone_c = zone.copy()
