@@ -31,8 +31,12 @@ void Actron485ZoneClimate::update_status() {
     // Current Temperature
     update_property(this->current_temperature, (float)actron_controller_->getZoneCurrentTemperature(number_), has_changed);
 
-    // Operating Mode
-    auto zone_on = actron_controller_->getZoneOn(number_) ? ClimateMode::CLIMATE_MODE_HEAT_COOL : ClimateMode::CLIMATE_MODE_OFF;
+    // Operating Mode — present as CLIMATE_MODE_AUTO when the zone is on.
+    // "Auto" reads as a clean on-label in HA / web frontends; HEAT_COOL
+    // (the closer-but-uglier alternative) renders as "Heat / Cool" which
+    // confuses users since the master climate already picks heat vs cool.
+    // The supported_modes set in traits() must match: [OFF, AUTO].
+    auto zone_on = actron_controller_->getZoneOn(number_) ? ClimateMode::CLIMATE_MODE_AUTO : ClimateMode::CLIMATE_MODE_OFF;
     update_property(this->mode, zone_on, has_changed);
 
     // Action Mode
@@ -53,10 +57,21 @@ void Actron485ZoneClimate::control(const climate::ClimateCall &call) {
     if (call.get_mode().has_value()) {
         bool isOn = call.get_mode().value() != ClimateMode::CLIMATE_MODE_OFF;
         actron_controller_->setZoneOn(number_, isOn);
-        this->mode = isOn ? ClimateMode::CLIMATE_MODE_HEAT_COOL : ClimateMode::CLIMATE_MODE_OFF;
+        this->mode = isOn ? ClimateMode::CLIMATE_MODE_AUTO : ClimateMode::CLIMATE_MODE_OFF;
     }
     if (call.get_target_temperature().has_value()) {
         float target = call.get_target_temperature().value();
+        // Clamp to master ± 2 °C (the wall LCD's authoritative per-zone
+        // setpoint range) before forwarding. The dashboard slider also
+        // advertises this range via traits(), but a HA service call can
+        // still send out-of-range values — clamp defensively.
+        float master = (float) actron_controller_->getMasterSetpoint();
+        float lo = master - 2.0f;
+        float hi = master + 2.0f;
+        if (lo < 16.0f) lo = 16.0f;
+        if (hi > 30.0f) hi = 30.0f;
+        if (target < lo) target = lo;
+        if (target > hi) target = hi;
         actron_controller_->setZoneSetpointTemperature(number_, target, ultima_adjusts_master_setpoint_);
         this->target_temperature = target;
     }
@@ -70,13 +85,31 @@ climate::ClimateTraits Actron485ZoneClimate::traits() {
         climate::ClimateFeature::CLIMATE_SUPPORTS_CURRENT_TEMPERATURE |
         climate::ClimateFeature::CLIMATE_SUPPORTS_ACTION
     );
-    traits.set_visual_min_temperature(16);
-    traits.set_visual_max_temperature(30);
+
+    // Per-zone setpoint clamps to master ± 2 °C — this is the wall LCD's
+    // documented constraint (Que Ultima behaviour). Falls back to the
+    // system bounds (16-30 °C) before any master state is known, or when
+    // the master setpoint is itself out of range. traits() is invoked
+    // fresh by ESPHome on every get_traits() call, so the slider range
+    // tracks master setpoint changes without further plumbing.
+    float master = (float) actron_controller_->getMasterSetpoint();
+    float lo = 16.0f;
+    float hi = 30.0f;
+    if (master >= 16.0f && master <= 30.0f) {
+        lo = master - 2.0f;
+        hi = master + 2.0f;
+        if (lo < 16.0f) lo = 16.0f;
+        if (hi > 30.0f) hi = 30.0f;
+    }
+    traits.set_visual_min_temperature(lo);
+    traits.set_visual_max_temperature(hi);
     traits.set_visual_temperature_step(0.5);
     traits.set_visual_current_temperature_step(0.1);
+    // [OFF, AUTO] — see update_status() comment. "Auto" reads as a clean
+    // on-label without lying (the system DOES decide heat vs cool).
     traits.set_supported_modes({
         ClimateMode::CLIMATE_MODE_OFF,
-        ClimateMode::CLIMATE_MODE_HEAT_COOL,
+        ClimateMode::CLIMATE_MODE_AUTO,
     });
 
     return traits;
