@@ -146,6 +146,15 @@ bool Actron485Api::set_zone_name_override(uint8_t zone, const std::string &name)
   if (name.size() > ZONE_NAME_MAX) return false;
   zone_name_overrides_[zone - 1] = name;
   this->save_zone_names_();
+  // Note: this updates the API-layer override and the Zone N Name text
+  // input on the dashboard, but the climate widget's "Zone N" label is
+  // baked at compile-time (EntityBase::name_ is a StringRef into static
+  // storage, no set_name() exists). Propagating the override to the
+  // climate widget label would need a per-entity name-override store +
+  // a virtual get_name() override — out of scope for this commit. For
+  // now the rename surfaces in the JSON API (/api/v1/info[zones], /state),
+  // in the rename input itself, and in the mobile app — but not on the
+  // climate card label.
   return true;
 }
 
