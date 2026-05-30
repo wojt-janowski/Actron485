@@ -85,6 +85,11 @@ class Actron485Climate : public climate::Climate, public Component {
         // setpoint shown on the LCD is sourced from this zone's setpoint
         // (see applySlave11StateBroadcast).
         void set_control_zone(int zone_number) { control_zone_number_ = zone_number; }
+        // When true, setup() enables Modbus slave-responder mode for slave 3
+        // so the firmware drives the AC in place of the wall LCD. See
+        // Actron485::Controller::setSlaveResponderMode for the hardware
+        // precondition (disconnect wall LCD data leads first).
+        void set_act_as_slave_3(bool enabled) { act_as_slave_3_ = enabled; }
 
         void add_zone(int number, Actron485ZoneFan *fan);
         void add_ultima_zone(int number, Actron485ZoneClimate *climate);
@@ -120,6 +125,7 @@ class Actron485Climate : public climate::Climate, public Component {
         bool has_ultima_;
         bool ultima_adjusts_master_setpoint_;
         int control_zone_number_ = 1;
+        bool act_as_slave_3_ = false;
         Actron485ZoneFan *zones_[8] = {};
         Actron485ZoneClimate *zone_climates_[8] = {};
 

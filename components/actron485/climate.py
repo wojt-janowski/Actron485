@@ -22,6 +22,7 @@ CONF_ULTIMA_AVAILABLE = "available"
 CONF_ULTIMA_ZONES_ADJUSTS_MASTER = "adjust_master_target"
 CONF_LOGGING_MODE = "logging_mode"
 CONF_CONTROL_ZONE = "control_zone"
+CONF_ACT_AS_SLAVE_3 = "act_as_slave_3"
 
 CONF_ZONE_NUMBER = "number"
 CONF_ZONE_NAME = "name"
@@ -74,6 +75,13 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_ESP_FAN_AVAILABLE, default=False): cv.boolean,
             cv.Optional(CONF_ULTIMA): cv.Schema(ultima_config_parameter),
             cv.Optional(CONF_CONTROL_ZONE, default=1): cv.int_range(min=1, max=8),
+            # When true, the firmware impersonates slave 3 (the wall
+            # controller) on the J6 DATA bus and answers AMIB polls from its
+            # own state buffer. Requires the wall LCD's data leads to be
+            # physically disconnected first — leaving both devices on the bus
+            # at the same slave id causes frame collisions. Default off so
+            # boot is safe; flip true only after the cutover.
+            cv.Optional(CONF_ACT_AS_SLAVE_3, default=False): cv.boolean,
         }
     )
     .extend(uart.UART_DEVICE_SCHEMA)
@@ -120,6 +128,7 @@ async def to_code(config):
     cg.add(var.set_has_esp(has_esp))
 
     cg.add(var.set_control_zone(config[CONF_CONTROL_ZONE]))
+    cg.add(var.set_act_as_slave_3(config[CONF_ACT_AS_SLAVE_3]))
 
     has_ultima = False
     if CONF_ULTIMA in config:

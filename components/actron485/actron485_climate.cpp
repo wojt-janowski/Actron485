@@ -67,6 +67,17 @@ void Actron485Climate::setup() {
     if (control_zone_number_ >= 1 && control_zone_number_ <= 8) {
         actron_controller.setControlZone((uint8_t) control_zone_number_, true);
     }
+    // Enable slave-3 responder if the YAML flag is set. Must happen AFTER
+    // setControlZone so the initial renderSlave3State() inside
+    // setSlaveResponderMode picks up the right zoneControlled[] mapping —
+    // master setpoint writes need that to know which zone to update.
+    if (act_as_slave_3_) {
+        ESP_LOGW(TAG, "act_as_slave_3 enabled — impersonating wall controller "
+                       "on Modbus slave 3. Wall LCD data leads MUST be "
+                       "disconnected from J6 DATA bus to avoid frame "
+                       "collisions.");
+        actron_controller.setSlaveResponderMode(3, true);
+    }
     logStream_ = LogStream();
     if (logging_mode_ > 0) {
         actron_controller.configureLogging(&logStream_);
@@ -256,6 +267,7 @@ climate::ClimateTraits Actron485Climate::traits() {
 void Actron485Climate::dump_config() {
   ESP_LOGCONFIG(TAG, "Actron485 Status:");
   ESP_LOGCONFIG(TAG, "  Receiving Data: %s", actron_controller.receivingData() ? "YES" : "NO");
+  ESP_LOGCONFIG(TAG, "  Act as Slave 3: %s", act_as_slave_3_ ? "YES" : "NO");
   this->dump_traits_(TAG);
 }
 
