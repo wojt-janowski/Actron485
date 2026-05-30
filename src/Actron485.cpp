@@ -1533,45 +1533,49 @@ namespace Actron485 {
         }
 
         OperatingMode currentMode = getOperatingMode();
-        
+        OperatingMode nextMode = currentMode;
+
         if (on) {
             switch (currentMode) {
-                case OperatingMode::Off:
-                    nextOperatingModeCommand.mode = OperatingMode::FanOnly;
-                    sendOperatingModeCommand = true;
-                    break;
-                case OperatingMode::OffAuto:
-                    nextOperatingModeCommand.mode = OperatingMode::Auto;
-                    sendOperatingModeCommand = true;
-                    break;
-                case OperatingMode::OffHeat:
-                    nextOperatingModeCommand.mode = OperatingMode::Heat;
-                    sendOperatingModeCommand = true;
-                    break;
-                case OperatingMode::OffCool:
-                    nextOperatingModeCommand.mode = OperatingMode::Cool;
-                    sendOperatingModeCommand = true;
-                    break;
+                case OperatingMode::Off:     nextMode = OperatingMode::FanOnly; break;
+                case OperatingMode::OffAuto: nextMode = OperatingMode::Auto;    break;
+                case OperatingMode::OffHeat: nextMode = OperatingMode::Heat;    break;
+                case OperatingMode::OffCool: nextMode = OperatingMode::Cool;    break;
+                default: break;  // already on
             }
         } else {
             switch (currentMode) {
-                case OperatingMode::FanOnly:
-                    nextOperatingModeCommand.mode = OperatingMode::Off;
-                    sendOperatingModeCommand = true;
-                    break;
-                case OperatingMode::Auto:
-                    nextOperatingModeCommand.mode = OperatingMode::OffAuto;
-                    sendOperatingModeCommand = true;
-                    break;
-                case OperatingMode::Heat:
-                    nextOperatingModeCommand.mode = OperatingMode::OffHeat;
-                    sendOperatingModeCommand = true;
-                    break;
-                case OperatingMode::Cool:
-                    nextOperatingModeCommand.mode = OperatingMode::OffCool;
-                    sendOperatingModeCommand = true;
-                    break;
+                case OperatingMode::FanOnly: nextMode = OperatingMode::Off;     break;
+                case OperatingMode::Auto:    nextMode = OperatingMode::OffAuto; break;
+                case OperatingMode::Heat:    nextMode = OperatingMode::OffHeat; break;
+                case OperatingMode::Cool:    nextMode = OperatingMode::OffCool; break;
+                default: break;  // already off
             }
+        }
+
+        if (nextMode == currentMode) {
+            return;
+        }
+        nextOperatingModeCommand.mode = nextMode;
+        sendOperatingModeCommand = true;
+
+        // Slave-3 responder: we are the source of truth. The legacy queue
+        // above is drained as a no-op (attemptToSendQueuedCommand), so we
+        // must apply the state ourselves and re-render the registers the
+        // AMIB will poll. Setting stateMessage2 directly also makes the
+        // HTTP API return the new state immediately rather than after the
+        // next ~6s poll cycle bounces our own response back to us.
+        if (_slaveResponderEnabled && _slaveResponderId == 3) {
+            stateMessage2.initialised = true;
+            // Collapse the Off* variants to plain Off for the renderer —
+            // reg 4 hi bit 1 is the only system-on signal on the wire.
+            if (nextMode == OperatingMode::OffAuto || nextMode == OperatingMode::OffCool
+                || nextMode == OperatingMode::OffHeat) {
+                stateMessage2.operatingMode = OperatingMode::Off;
+            } else {
+                stateMessage2.operatingMode = nextMode;
+            }
+            renderSlave3State();
         }
     }
 
@@ -1598,23 +1602,22 @@ namespace Actron485 {
         }
 
         bool continuous = getContinuousFanMode();
+        FanMode resolved = fanSpeed;
         switch (fanSpeed) {
-            case FanMode::Low:
-                nextFanModeCommand.fanMode = continuous ? FanMode::LowContinuous : fanSpeed;
-                sendFanModeCommand = true;
-                break;
-            case FanMode::Medium:
-                nextFanModeCommand.fanMode = continuous ? FanMode::MediumContinuous : fanSpeed;
-                sendFanModeCommand = true;
-                break;
-            case FanMode::High:
-                nextFanModeCommand.fanMode = continuous ? FanMode::HighContinuous : fanSpeed;
-                sendFanModeCommand = true;
-                break;
-            case FanMode::Esp:
-                nextFanModeCommand.fanMode = continuous ? FanMode::EspContinuous : fanSpeed;
-                sendFanModeCommand = true;
-                break;
+            case FanMode::Low:    resolved = continuous ? FanMode::LowContinuous    : fanSpeed; break;
+            case FanMode::Medium: resolved = continuous ? FanMode::MediumContinuous : fanSpeed; break;
+            case FanMode::High:   resolved = continuous ? FanMode::HighContinuous   : fanSpeed; break;
+            case FanMode::Esp:    resolved = continuous ? FanMode::EspContinuous    : fanSpeed; break;
+            default: return;  // Off / *Continuous from caller: ignore (use setFanSpeedAbsolute)
+        }
+
+        nextFanModeCommand.fanMode = resolved;
+        sendFanModeCommand = true;
+
+        if (_slaveResponderEnabled && _slaveResponderId == 3) {
+            stateMessage2.initialised = true;
+            stateMessage2.fanMode = resolved;
+            renderSlave3State();
         }
     }
 
@@ -1647,6 +1650,16 @@ namespace Actron485 {
 
         nextFanModeCommand.fanMode = fanSpeed;
         sendFanModeCommand = true;
+
+        if (_slaveResponderEnabled && _slaveResponderId == 3) {
+            stateMessage2.initialised = true;
+            stateMessage2.fanMode = fanSpeed;
+            stateMessage2.continuousFan = (fanSpeed == FanMode::LowContinuous
+                || fanSpeed == FanMode::MediumContinuous
+                || fanSpeed == FanMode::HighContinuous
+                || fanSpeed == FanMode::EspContinuous);
+            renderSlave3State();
+        }
     }
 
     void Controller::setContinuousFanMode(bool on) {
@@ -1655,23 +1668,22 @@ namespace Actron485 {
         }
 
         FanMode fanSpeed = getFanSpeed();
+        FanMode resolved = fanSpeed;
         switch (fanSpeed) {
-            case FanMode::Low:
-                nextFanModeCommand.fanMode = on ? FanMode::LowContinuous : fanSpeed;
-                sendFanModeCommand = true;
-                break;
-            case FanMode::Medium:
-                nextFanModeCommand.fanMode = on ? FanMode::MediumContinuous : fanSpeed;
-                sendFanModeCommand = true;
-                break;
-            case FanMode::High:
-                nextFanModeCommand.fanMode = on ? FanMode::HighContinuous : fanSpeed;
-                sendFanModeCommand = true;
-                break;
-            case FanMode::Esp:
-                nextFanModeCommand.fanMode = on ? FanMode::EspContinuous : fanSpeed;
-                sendFanModeCommand = true;
-                break;
+            case FanMode::Low:    resolved = on ? FanMode::LowContinuous    : fanSpeed; break;
+            case FanMode::Medium: resolved = on ? FanMode::MediumContinuous : fanSpeed; break;
+            case FanMode::High:   resolved = on ? FanMode::HighContinuous   : fanSpeed; break;
+            case FanMode::Esp:    resolved = on ? FanMode::EspContinuous    : fanSpeed; break;
+            default: return;
+        }
+        nextFanModeCommand.fanMode = resolved;
+        sendFanModeCommand = true;
+
+        if (_slaveResponderEnabled && _slaveResponderId == 3) {
+            stateMessage2.initialised = true;
+            stateMessage2.fanMode = resolved;
+            stateMessage2.continuousFan = on;
+            renderSlave3State();
         }
     }
 
@@ -1700,9 +1712,16 @@ namespace Actron485 {
 
         if (mode == OperatingMode::Off) {
             setSystemOn(false);
-        } else {
-            nextOperatingModeCommand.mode = mode;
-            sendOperatingModeCommand = true;
+            return;
+        }
+
+        nextOperatingModeCommand.mode = mode;
+        sendOperatingModeCommand = true;
+
+        if (_slaveResponderEnabled && _slaveResponderId == 3) {
+            stateMessage2.initialised = true;
+            stateMessage2.operatingMode = mode;
+            renderSlave3State();
         }
     }
 
@@ -1724,6 +1743,21 @@ namespace Actron485 {
 
         nextSetpointCommand.temperature = temperature;
         sendSetpointCommand = true;
+
+        // Slave-3 responder: master setpoint = control-zone's setpoint
+        // (PROTOCOL_NOTES.md line ~222). Any zone marked controlled by this
+        // module receives the new setpoint; in the typical single-zone rig
+        // only one is set, but multi-zone configs cascade as expected.
+        if (_slaveResponderEnabled && _slaveResponderId == 3) {
+            for (int z = 0; z < 8; z++) {
+                if (zoneControlled[z]) {
+                    zoneSetpoint[z] = temperature;
+                }
+            }
+            stateMessage2.initialised = true;
+            stateMessage2.setpoint = temperature;
+            renderSlave3State();
+        }
     }
     
     double Controller::getMasterSetpoint() {
@@ -1789,6 +1823,12 @@ namespace Actron485 {
 
         _sendZoneStateCommandCleared = false;
         sendZoneStateCommand = true;
+
+        if (_slaveResponderEnabled && _slaveResponderId == 3) {
+            stateMessage2.initialised = true;
+            stateMessage2.zoneOn[zindex(zone)] = on;
+            renderSlave3State();
+        }
     }
 
     bool Controller::getZoneOn(uint8_t zone) {
@@ -1827,11 +1867,24 @@ namespace Actron485 {
             zoneSetpoint[zindex(zone)] = temperature;
 
         } else {
-            // Send the custom zone setpoint message, the official 
+            // Send the custom zone setpoint message, the official
             nextZoneSetpointCustomCommand.temperature = temperature;
             nextZoneSetpointCustomCommand.adjustMaster = adjustMaster;
             nextZoneSetpointCustomCommand.zone = zone;
             sendZoneSetpointCustomCommand = true;
+
+            // Slave-3 responder: zone is "ours" by virtue of us being the
+            // wall controller, so just write the setpoint directly. ICAMIB
+            // documents per-zone setpoints as read-only over its BMS port
+            // — that's a gateway constraint, not a bus one; the underlying
+            // slave-3 register is plain readable state we author.
+            if (_slaveResponderEnabled && _slaveResponderId == 3) {
+                zoneSetpoint[zindex(zone)] = temperature;
+            }
+        }
+
+        if (_slaveResponderEnabled && _slaveResponderId == 3) {
+            renderSlave3State();
         }
     }
 
@@ -1888,6 +1941,17 @@ namespace Actron485 {
 
     void Controller::setZoneCurrentTemperature(uint8_t zone, double temperature) {
         zoneTemperature[zindex(zone)] = temperature;
+
+        // Slave-3 responder: this is THE input that drives the AMIB's
+        // per-zone-temperature awareness. Re-encode the affected reg
+        // (reg 5 + zindex(zone)) so the next AMIB poll sees the new offset
+        // byte. encodeSlave3ZoneRegister handles NaN by reporting zero
+        // offset — the AMIB treats that as at-setpoint.
+        if (_slaveResponderEnabled && _slaveResponderId == 3
+            && zone >= 1 && zone <= 8) {
+            _slaveRegisters[5 + zindex(zone)] = encodeSlave3ZoneRegister(
+                zoneSetpoint[zindex(zone)], temperature);
+        }
     }
 
     double Controller::getZoneCurrentTemperature(uint8_t zone) {
