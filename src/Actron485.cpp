@@ -809,9 +809,22 @@ namespace Actron485 {
 
         // 8 zone temp offsets (regs 8-11, bytes data[12..19]) — signed int8
         // tenths of °C, RELATIVE TO THAT ZONE'S OWN SETPOINT.
-        for (int z = 0; z < 8; z++) {
-            int8_t offset = (int8_t) data[12 + z];
-            zoneTemperature[z] = zoneSetpoint[z] + (double(offset) * 0.1);
+        //
+        // In slave-3 responder mode this would be a self-referential feedback
+        // loop: we encode offset = (zoneTemperature - zoneSetpoint) × 10 into
+        // reg 5-12 → AMIB rebroadcasts → we parse the same offset back into
+        // zoneTemperature. Net no-op in steady state, but if zoneTemperature
+        // is ever bogus (e.g. NVS load loaded a corrupted setpoint that the
+        // encoder clamped to 127.5 °C — observed 2026-05-30), the loop
+        // preserves the bogosity forever because the offset round-trips
+        // unchanged. Skip the update in responder mode: the *only*
+        // authoritative source for zoneTemperature is external sensor
+        // pushes via /api/v1/zones/{n}/temperature (setZoneCurrentTemperature).
+        if (!_slaveResponderEnabled) {
+            for (int z = 0; z < 8; z++) {
+                int8_t offset = (int8_t) data[12 + z];
+                zoneTemperature[z] = zoneSetpoint[z] + (double(offset) * 0.1);
+            }
         }
 
         // Master setpoint = the wall-controller zone's setpoint (Phase 2 #11

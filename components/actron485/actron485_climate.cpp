@@ -7,6 +7,7 @@
 #include "zone_climate.h"
 
 #include <cstring>
+#include <cmath>
 
 namespace esphome {
 namespace actron485 {
@@ -305,6 +306,26 @@ void Actron485Climate::load_slave3_state_() {
     // Restore: directly populate the controller's typed state. We do this
     // BEFORE setSlaveResponderMode runs initSlave3Defaults, which is
     // load-aware (only fills in zero / uninitialised fields).
+    //
+    // Defensive bounds checks on the loaded zone setpoints. Observed in the
+    // wild on 2026-05-30 boot: NVS came back with several zoneSetpoint[]
+    // entries at 127.5 / 62.5 / 32.5 °C — root cause uncertain (possibly
+    // partially-corrupt broadcast bytes that flowed through
+    // applySlave11StateBroadcast → save during an earlier session). The
+    // encoder happily clamped these and published reg 4-12 with garbage
+    // setpoints; the AMIB then drove the system off-spec. Substitute the
+    // 22 °C default for any out-of-range value and log so it's noticeable.
+    bool anyClamped = false;
+    for (int z = 0; z < 8; z++) {
+        double sp = blob.zone_setpoints[z];
+        if (!std::isfinite(sp) || sp < 10.0 || sp > 40.0) {
+            ESP_LOGW(TAG, "Saved zone %d setpoint %.1f °C out of [10, 40] — "
+                          "substituting 22 °C", z + 1, sp);
+            blob.zone_setpoints[z] = 22.0;
+            anyClamped = true;
+        }
+    }
+
     actron_controller.stateMessage2.operatingMode = (Actron485::OperatingMode) blob.operating_mode;
     actron_controller.stateMessage2.fanMode       = (Actron485::FanMode) blob.fan_mode;
     actron_controller.stateMessage2.continuousFan = blob.continuous_fan != 0;
@@ -314,9 +335,15 @@ void Actron485Climate::load_slave3_state_() {
         actron_controller.zoneSetpoint[z]         = blob.zone_setpoints[z];
     }
     actron_controller.stateMessage2.initialised = true;
-    last_persisted_ = blob;
-    ESP_LOGI(TAG, "Restored slave-3 state from NVS (mode=%u fan=%u zones=0x%02X)",
-             blob.operating_mode, blob.fan_mode, blob.zone_on_bitmap);
+    // last_persisted_ tracks "what's currently on disk" for memcmp-skip
+    // in maybe_save_slave3_state_(). If we just substituted values, the
+    // sanitised state diverges from the disk blob — force last_persisted_
+    // back to a zero state so the next save unconditionally overwrites
+    // the bad NVS contents.
+    last_persisted_ = anyClamped ? Slave3PersistedState{} : blob;
+    ESP_LOGI(TAG, "Restored slave-3 state from NVS (mode=%u fan=%u zones=0x%02X%s)",
+             blob.operating_mode, blob.fan_mode, blob.zone_on_bitmap,
+             anyClamped ? " — clamped" : "");
 }
 
 void Actron485Climate::maybe_save_slave3_state_() {
