@@ -155,10 +155,16 @@ Controller::RegisterCacheLookup Controller::updateRegisterCache(uint8_t slave, u
 }
 
 void Controller::printRegisterDelta(uint8_t slave, uint16_t address, uint16_t value) {
+    // Always update the cache (so /api/v1/bus has live state regardless of
+    // logging mode). Only emit the human-readable delta line when actually
+    // in RegisterDelta logging mode AND we have a print sink.
+    auto lookup = updateRegisterCache(slave, address, value);
+    if (printOutMode != PrintOutMode::RegisterDelta) {
+        return;
+    }
     if (!printOut) {
         return;
     }
-    auto lookup = updateRegisterCache(slave, address, value);
     if (lookup.seen && lookup.oldValue == value) {
         return;
     }
@@ -182,53 +188,71 @@ void Controller::printRegisterDelta(uint8_t slave, uint16_t address, uint16_t va
     printOut->println();
 }
 
+// Extract (slave, address, value) tuples from the validated Modbus frame
+// currently in `_serialBuffer` and feed each into `printRegisterDelta`,
+// which always updates `_registerCache` and only prints when in
+// RegisterDelta mode. Called unconditionally from `processModbusFrame()`
+// so the cache (and /api/v1/bus) stays populated regardless of logging
+// mode.
+//
+// Read responses without a recent matching request are silently dropped
+// because we can't know their address range — same restriction as the
+// older delta-walker had.
+void Controller::captureFrameRegisters() {
+    if (_serialBufferIndex < 4) {
+        return;
+    }
+    const uint8_t *frame = _serialBuffer;
+    uint8_t length = _serialBufferIndex;
+    uint8_t slave = frame[0];
+    uint8_t function = frame[1];
+
+    if ((function & 0x80) != 0) {
+        return;  // exception response, no register payload
+    }
+
+    if (function == 0x10 && length >= 9) {
+        // Function 0x10 — Write Multiple Registers Request.
+        // [slave][0x10][addrHi][addrLo][cntHi][cntLo][byteCount][data...][crc]
+        uint16_t startAddr = (uint16_t(frame[2]) << 8) | frame[3];
+        uint8_t byteCount = frame[6];
+        if (!(byteCount & 1) && length >= uint8_t(9 + byteCount)) {
+            uint16_t regCount = byteCount / 2;
+            for (uint16_t i = 0; i < regCount; i++) {
+                uint16_t value = (uint16_t(frame[7 + i * 2]) << 8) | frame[7 + i * 2 + 1];
+                printRegisterDelta(slave, startAddr + i, value);
+            }
+        }
+        return;
+    }
+
+    if (function == 0x03 && length != 8) {
+        // Function 0x03 — Read Holding Registers RESPONSE.
+        // Match against the most recent request to get start addr.
+        unsigned long now = platformMillis();
+        if (length >= 5 && (now - _modbusLastReadTimestamp) <= 5000 &&
+            _modbusLastReadSlave == slave && _modbusLastReadFunction == 0x03) {
+            uint8_t byteCount = frame[2];
+            if (!(byteCount & 1) && length >= uint8_t(byteCount + 5)) {
+                uint16_t regCount = byteCount / 2;
+                for (uint16_t i = 0; i < regCount; i++) {
+                    uint16_t value = (uint16_t(frame[3 + i * 2]) << 8) | frame[3 + i * 2 + 1];
+                    printRegisterDelta(slave, _modbusLastReadStartAddress + i, value);
+                }
+            }
+        }
+    }
+}
+
 void Controller::printModbusMessage() {
     if (!printOut || _serialBufferIndex < 4) {
         return;
     }
 
     if (printOutMode == PrintOutMode::RegisterDelta) {
-        // Delta-mode walker: extract (slave, address, value) tuples from a
-        // validated Modbus RTU frame and call printRegisterDelta for each.
-        // Skips frame headers, raw byte dumps, and float interpretations —
-        // those are noise in delta mode. Read responses without a recent
-        // matching request are silently dropped because we can't know their
-        // address range.
-        const uint8_t *frame = _serialBuffer;
-        uint8_t length = _serialBufferIndex;
-        uint8_t slave = frame[0];
-        uint8_t function = frame[1];
-
-        if ((function & 0x80) == 0) {
-            // Function 0x10 — Write Multiple Registers Request.
-            // [slave][0x10][addrHi][addrLo][cntHi][cntLo][byteCount][data...][crc]
-            if (function == 0x10 && length >= 9) {
-                uint16_t startAddr = (uint16_t(frame[2]) << 8) | frame[3];
-                uint8_t byteCount = frame[6];
-                if (!(byteCount & 1) && length >= uint8_t(9 + byteCount)) {
-                    uint16_t regCount = byteCount / 2;
-                    for (uint16_t i = 0; i < regCount; i++) {
-                        uint16_t value = (uint16_t(frame[7 + i * 2]) << 8) | frame[7 + i * 2 + 1];
-                        printRegisterDelta(slave, startAddr + i, value);
-                    }
-                }
-            } else if (function == 0x03 && length != 8) {
-                // Function 0x03 — Read Holding Registers RESPONSE.
-                // Match against the most recent request to get start addr.
-                unsigned long now = platformMillis();
-                if (length >= 5 && (now - _modbusLastReadTimestamp) <= 5000 &&
-                    _modbusLastReadSlave == slave && _modbusLastReadFunction == 0x03) {
-                    uint8_t byteCount = frame[2];
-                    if (!(byteCount & 1) && length >= uint8_t(byteCount + 5)) {
-                        uint16_t regCount = byteCount / 2;
-                        for (uint16_t i = 0; i < regCount; i++) {
-                            uint16_t value = (uint16_t(frame[3 + i * 2]) << 8) | frame[3 + i * 2 + 1];
-                            printRegisterDelta(slave, _modbusLastReadStartAddress + i, value);
-                        }
-                    }
-                }
-            }
-        }
+        // RegisterDelta mode prints the delta lines as a side effect of
+        // captureFrameRegisters(), which has already run from
+        // processModbusFrame() at this point. Nothing more to print here.
         return;
     }
 

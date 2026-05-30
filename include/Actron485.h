@@ -170,6 +170,12 @@ private:
     void applySlave3ReadResponse(uint16_t startAddress, uint16_t regCount, const uint8_t *data);
     /// @brief Prints a decoded Modbus RTU summary for current serial buffer
     void printModbusMessage();
+    /// @brief Extract (slave, address, value) tuples from the validated
+    /// Modbus frame in `_serialBuffer` and update `_registerCache` for each.
+    /// Runs unconditionally from `processModbusFrame()` so the cache (and
+    /// the `/api/v1/bus` diagnostics endpoint) is always populated, even
+    /// when `logging_mode` is not DELTA.
+    void captureFrameRegisters();
     /// @brief In RegisterDelta mode, look up and update the cached value for
     /// (slave, address). Outputs whether the slot was previously seen and the
     /// previous value/timestamp; the new value is stored before returning.

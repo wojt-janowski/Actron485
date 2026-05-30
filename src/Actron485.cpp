@@ -371,9 +371,12 @@ namespace Actron485 {
         // bytes from a Modbus stream.
         if (isModbusMessage()) {
             processModbusFrame(_serialBuffer, _serialBufferIndex);
+            // Always update the register cache so /api/v1/bus has live
+            // state regardless of logging mode. printRegisterDelta()
+            // gates its own console output on printOutMode internally.
+            captureFrameRegisters();
             if (printOut && (printOutMode == PrintOutMode::AllMessages
-                           || printOutMode == PrintOutMode::CorrelationCapture
-                           || printOutMode == PrintOutMode::RegisterDelta)) {
+                           || printOutMode == PrintOutMode::CorrelationCapture)) {
                 printModbusMessage();
             }
         }
