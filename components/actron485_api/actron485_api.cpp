@@ -517,6 +517,43 @@ void Actron485Api::set_timezone_runtime(const std::string &tz) {
   ESP_LOGI(TAG, "Timezone set to %s", timezone_.c_str());
 }
 
+// Friendly Australian-region dropdown over the POSIX TZ string. Keyed by
+// distinct offset/DST behaviour (not city), so each label maps 1:1 to a
+// unique POSIX string and the reverse lookup is unambiguous. Australia only —
+// there are no Actron Que installs outside AU.
+namespace {
+struct TzOption {
+  const char *label;
+  const char *posix;
+};
+const TzOption kTzOptions[] = {
+  {"NSW/VIC/ACT/TAS (Eastern, DST)",       "AEST-10AEDT,M10.1.0,M4.1.0/3"},
+  {"Queensland (Eastern, no DST)",         "AEST-10"},
+  {"South Australia (Central, DST)",       "ACST-9:30ACDT,M10.1.0,M4.1.0/3"},
+  {"Northern Territory (Central, no DST)", "ACST-9:30"},
+  {"Western Australia (no DST)",           "AWST-8"},
+};
+}  // namespace
+
+std::string Actron485Api::timezone_label() {
+  std::string tz = this->timezone();
+  for (const auto &o : kTzOptions) {
+    if (tz == o.posix) return o.label;
+  }
+  return "";  // custom POSIX string — not one of the presets
+}
+
+bool Actron485Api::set_timezone_by_label(const std::string &label) {
+  for (const auto &o : kTzOptions) {
+    if (label == o.label) {
+      this->set_timezone_runtime(o.posix);
+      return true;
+    }
+  }
+  ESP_LOGW(TAG, "Unknown timezone label: %s", label.c_str());
+  return false;
+}
+
 void Actron485Api::set_api_key_runtime(const std::string &key) {
   auth_token_ = key;
   this->save_settings_();

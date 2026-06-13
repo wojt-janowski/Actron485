@@ -50,6 +50,12 @@ class Actron485Api : public Component {
   // in its own NVS slot so the weather/api_key settings blob is untouched.
   std::string timezone();
   void set_timezone_runtime(const std::string &tz);
+  // Friendly Australian-region dropdown over the POSIX TZ string. Each label
+  // maps 1:1 to a distinct POSIX string (keyed by offset/DST behaviour, not
+  // city, so the reverse lookup is unambiguous). timezone_label() returns the
+  // matching label or "" when the current TZ is a custom string.
+  std::string timezone_label();
+  bool set_timezone_by_label(const std::string &label);
 
   void setup() override;
   void loop() override;
