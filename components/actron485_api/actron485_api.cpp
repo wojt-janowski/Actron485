@@ -15,6 +15,7 @@
 #include <esp_http_server.h>
 #include <esp_http_client.h>
 #include <esp_crt_bundle.h>
+#include <esp_system.h>
 #include <ArduinoJson.h>
 
 namespace esphome {
@@ -128,7 +129,21 @@ void Actron485Api::weather_task_() {
   for (;;) {
     bool configured = this->weather_api_key_set() && this->weather_location_set();
     if (configured && network::is_connected()) {
+      // Snapshot config once for both fetches — the dashboard/API can mutate
+      // the key + location from another task at any time.
+      std::string key;
+      float lat, lon;
+      if (weather_mutex_) xSemaphoreTake(weather_mutex_, portMAX_DELAY);
+      key = weather_api_key_;
+      lat = weather_lat_;
+      lon = weather_lon_;
+      if (weather_mutex_) xSemaphoreGive(weather_mutex_);
+
       bool ok = this->fetch_weather_();
+      // Forecast is best-effort and on its own provider path; a failure here
+      // keeps the last-known-good forecast and never disturbs the current
+      // reading that drives the retry cadence below.
+      this->fetch_forecast_(key, lat, lon);
       // Full interval on success; quick 60s retry on failure so a transient
       // error, or a brand-new OpenWeather key that isn't active yet (returns
       // HTTP 401 for up to ~2h), recovers without a full 15-min wait.
@@ -355,6 +370,469 @@ std::string Actron485Api::weather_status_summary() {
   // "18.7°C · Partly cloudy" (° = U+00B0, · = U+00B7, both UTF-8 literals)
   snprintf(out, sizeof(out), "%.1f\xC2\xB0""C \xC2\xB7 %s", temp,
            condition.empty() ? "—" : condition.c_str());
+  return std::string(out);
+}
+
+void Actron485Api::set_forecast_error_(const std::string &msg) {
+  if (weather_mutex_) xSemaphoreTake(weather_mutex_, portMAX_DELAY);
+  forecast_error_ = msg;
+  if (weather_mutex_) xSemaphoreGive(weather_mutex_);
+}
+
+// Blocking HTTPS GET shared by the forecast fetchers. Returns true when the
+// transport succeeded (any HTTP status — the caller inspects `status`); false
+// only on connect/TLS failure (reason in *err_name). The body is always read
+// so callers can inspect error payloads (e.g. the One Call subscription 401).
+bool Actron485Api::http_get_(const char *url, std::string &body, int &status,
+                             size_t cap, std::string *err_name) {
+  body.clear();
+  status = 0;
+  esp_http_client_config_t cfg = {};
+  cfg.url = url;
+  cfg.timeout_ms = 8000;
+  cfg.crt_bundle_attach = esp_crt_bundle_attach;
+  cfg.disable_auto_redirect = false;
+  esp_http_client_handle_t client = esp_http_client_init(&cfg);
+  if (client == nullptr) {
+    if (err_name) *err_name = "client init failed";
+    return false;
+  }
+  esp_err_t err = esp_http_client_open(client, 0);
+  if (err != ESP_OK) {
+    if (err_name) *err_name = esp_err_to_name(err);
+    esp_http_client_cleanup(client);
+    return false;
+  }
+  esp_http_client_fetch_headers(client);
+  status = esp_http_client_get_status_code(client);
+  char buf[512];
+  int r;
+  while ((r = esp_http_client_read(client, buf, sizeof(buf))) > 0) {
+    body.append(buf, (size_t) r);
+    if (body.size() > cap) break;  // safety cap — forecast payloads are ~20-35 KB
+  }
+  esp_http_client_close(client);
+  esp_http_client_cleanup(client);
+  return true;
+}
+
+// Builds the One Call 3.0 URL into `out`. exclude=minutely,alerts trims the
+// payload to current + hourly(48) + daily(8) — the parts the wall renders.
+static void build_onecall_url(char *out, size_t n, float lat, float lon,
+                              const std::string &key) {
+  snprintf(out, n,
+           "https://api.openweathermap.org/data/3.0/onecall"
+           "?lat=%.4f&lon=%.4f&units=metric&exclude=minutely,alerts&appid=%s",
+           lat, lon, key.c_str());
+}
+
+bool Actron485Api::fetch_forecast_(const std::string &key, float lat, float lon) {
+  if (key.empty()) return false;
+  static const size_t kForecastCap = 49152;  // 48 KB — fits onecall + free
+
+  WeatherSource src;
+  if (weather_mutex_) xSemaphoreTake(weather_mutex_, portMAX_DELAY);
+  src = weather_source_;
+  if (weather_mutex_) xSemaphoreGive(weather_mutex_);
+
+  // Provider detection (only while UNKNOWN). Probe One Call 3.0 once: a 200
+  // latches ONECALL and we parse the probe body directly (no second call); a
+  // 401/403 whose body names the subscription latches FREE; any other failure
+  // (invalid/inactive key, 429, 5xx) leaves the source UNKNOWN so it re-probes
+  // next cycle — important so a brand-new key promotes to ONECALL once active.
+  if (src == WeatherSource::UNKNOWN) {
+    char url[256];
+    build_onecall_url(url, sizeof(url), lat, lon, key);
+    std::string body, errn;
+    int status = 0;
+    if (!http_get_(url, body, status, kForecastCap, &errn)) {
+      ESP_LOGW(TAG, "forecast: onecall probe connect failed: %s", errn.c_str());
+      this->set_forecast_error_(std::string("network/TLS error (") + errn + ")");
+      return false;
+    }
+    ESP_LOGI(TAG, "forecast: onecall probe HTTP %d", status);
+    if (status == 200) {
+      if (weather_mutex_) xSemaphoreTake(weather_mutex_, portMAX_DELAY);
+      weather_source_ = WeatherSource::ONECALL;
+      if (weather_mutex_) xSemaphoreGive(weather_mutex_);
+      ESP_LOGI(TAG, "forecast: provider = One Call 3.0");
+      if (this->parse_onecall_response_(body)) return true;
+      this->set_forecast_error_("unexpected One Call response");
+      return false;
+    }
+    bool not_subscribed = (status == 401 || status == 403) &&
+                          (body.find("subscri") != std::string::npos ||
+                           body.find("One Call") != std::string::npos ||
+                           body.find("one call") != std::string::npos);
+    if (not_subscribed) {
+      if (weather_mutex_) xSemaphoreTake(weather_mutex_, portMAX_DELAY);
+      weather_source_ = WeatherSource::FREE;
+      if (weather_mutex_) xSemaphoreGive(weather_mutex_);
+      ESP_LOGI(TAG, "forecast: key not subscribed to One Call - using free 5-day/3-hour forecast");
+    } else {
+      ESP_LOGW(TAG, "forecast: onecall probe HTTP %d (not a subscription error; "
+                    "will re-probe next cycle, trying free forecast for now)", status);
+    }
+    src = WeatherSource::FREE;  // try the free forecast this cycle either way
+  }
+
+  if (src == WeatherSource::ONECALL) {
+    char url[256];
+    build_onecall_url(url, sizeof(url), lat, lon, key);
+    std::string body, errn;
+    int status = 0;
+    if (!http_get_(url, body, status, kForecastCap, &errn)) {
+      this->set_forecast_error_(std::string("network/TLS error (") + errn + ")");
+      return false;
+    }
+    if (status != 200) {
+      ESP_LOGW(TAG, "forecast: onecall HTTP %d (keeping last-known-good)", status);
+      char m[40];
+      snprintf(m, sizeof(m), "HTTP %d from One Call", status);
+      this->set_forecast_error_(m);
+      return false;
+    }
+    if (this->parse_onecall_response_(body)) return true;
+    this->set_forecast_error_("unexpected One Call response");
+    return false;
+  }
+
+  // FREE tier: 5-day / 3-hour forecast.
+  char url[256];
+  snprintf(url, sizeof(url),
+           "https://api.openweathermap.org/data/2.5/forecast"
+           "?lat=%.4f&lon=%.4f&units=metric&appid=%s",
+           lat, lon, key.c_str());
+  std::string body, errn;
+  int status = 0;
+  if (!http_get_(url, body, status, kForecastCap, &errn)) {
+    this->set_forecast_error_(std::string("network/TLS error (") + errn + ")");
+    return false;
+  }
+  ESP_LOGI(TAG, "forecast: free HTTP %d", status);
+  if (status != 200) {
+    if (status == 401) {
+      this->set_forecast_error_("HTTP 401 - check API key (new keys take up to ~2h to activate)");
+    } else {
+      char m[44];
+      snprintf(m, sizeof(m), "HTTP %d from forecast API", status);
+      this->set_forecast_error_(m);
+    }
+    return false;
+  }
+  if (this->parse_free_forecast_response_(body)) return true;
+  this->set_forecast_error_("unexpected forecast response");
+  return false;
+}
+
+bool Actron485Api::parse_onecall_response_(const std::string &body) {
+  // Filter: only deserialize the fields we keep, so the ~30 KB payload never
+  // becomes a full in-RAM DOM. [0] in a filter applies to every array element.
+  JsonDocument filter;
+  filter["hourly"][0]["dt"] = true;
+  filter["hourly"][0]["temp"] = true;
+  filter["hourly"][0]["pop"] = true;
+  filter["hourly"][0]["weather"][0]["id"] = true;
+  filter["hourly"][0]["weather"][0]["icon"] = true;
+  filter["daily"][0]["dt"] = true;
+  filter["daily"][0]["temp"]["min"] = true;
+  filter["daily"][0]["temp"]["max"] = true;
+  filter["daily"][0]["pop"] = true;
+  filter["daily"][0]["weather"][0]["id"] = true;
+  filter["daily"][0]["weather"][0]["icon"] = true;
+
+  JsonDocument doc;
+  DeserializationError err =
+      deserializeJson(doc, body, DeserializationOption::Filter(filter));
+  if (err) {
+    ESP_LOGW(TAG, "forecast: onecall parse error: %s", err.c_str());
+    return false;
+  }
+
+  ForecastHour hours[FORECAST_HOURS_MAX];
+  int nh = 0;
+  for (JsonObject h : doc["hourly"].as<JsonArray>()) {
+    if (nh >= FORECAST_HOURS_MAX) break;
+    hours[nh].dt = h["dt"] | 0;
+    hours[nh].temp = h["temp"] | NAN;
+    hours[nh].pop = (uint8_t) ((h["pop"] | 0.0f) * 100.0f + 0.5f);
+    const char *icon = "";
+    int id = 0;
+    JsonArray w = h["weather"].as<JsonArray>();
+    if (!w.isNull() && w.size() > 0) { icon = w[0]["icon"] | ""; id = w[0]["id"] | 0; }
+    strncpy(hours[nh].icon, map_weather_icon_(icon, id), sizeof(hours[nh].icon) - 1);
+    hours[nh].icon[sizeof(hours[nh].icon) - 1] = '\0';
+    nh++;
+  }
+
+  ForecastDay days[FORECAST_DAYS_MAX];
+  int nd = 0;
+  for (JsonObject d : doc["daily"].as<JsonArray>()) {
+    if (nd >= FORECAST_DAYS_MAX) break;
+    days[nd].dt = d["dt"] | 0;
+    days[nd].temp_min = d["temp"]["min"] | NAN;
+    days[nd].temp_max = d["temp"]["max"] | NAN;
+    days[nd].pop = (uint8_t) ((d["pop"] | 0.0f) * 100.0f + 0.5f);
+    const char *icon = "";
+    int id = 0;
+    JsonArray w = d["weather"].as<JsonArray>();
+    if (!w.isNull() && w.size() > 0) { icon = w[0]["icon"] | ""; id = w[0]["id"] | 0; }
+    strncpy(days[nd].icon, map_weather_icon_(icon, id), sizeof(days[nd].icon) - 1);
+    days[nd].icon[sizeof(days[nd].icon) - 1] = '\0';
+    nd++;
+  }
+
+  if (nh == 0 && nd == 0) return false;
+
+  if (weather_mutex_) xSemaphoreTake(weather_mutex_, portMAX_DELAY);
+  if (nh) memcpy(forecast_hours_, hours, sizeof(ForecastHour) * nh);
+  if (nd) memcpy(forecast_days_, days, sizeof(ForecastDay) * nd);
+  forecast_hours_count_ = nh;
+  forecast_days_count_ = nd;
+  forecast_available_ = true;
+  forecast_updated_ms_ = millis();
+  forecast_error_.clear();
+  if (weather_mutex_) xSemaphoreGive(weather_mutex_);
+  ESP_LOGI(TAG, "forecast: onecall ok (%d hours, %d days; body %u B, free heap %u)",
+           nh, nd, (unsigned) body.size(), (unsigned) esp_get_free_heap_size());
+  return true;
+}
+
+bool Actron485Api::parse_free_forecast_response_(const std::string &body) {
+  JsonDocument filter;
+  filter["list"][0]["dt"] = true;
+  filter["list"][0]["main"]["temp"] = true;
+  filter["list"][0]["main"]["temp_min"] = true;
+  filter["list"][0]["main"]["temp_max"] = true;
+  filter["list"][0]["pop"] = true;
+  filter["list"][0]["weather"][0]["id"] = true;
+  filter["list"][0]["weather"][0]["icon"] = true;
+  filter["city"]["timezone"] = true;
+
+  JsonDocument doc;
+  DeserializationError err =
+      deserializeJson(doc, body, DeserializationOption::Filter(filter));
+  if (err) {
+    ESP_LOGW(TAG, "forecast: free parse error: %s", err.c_str());
+    return false;
+  }
+  JsonArray list = doc["list"].as<JsonArray>();
+  if (list.isNull() || list.size() == 0) return false;
+
+  // Local-day offset (seconds) for grouping the 3-hour blocks into calendar
+  // days at the install location.
+  long tz = (long) (doc["city"]["timezone"] | 0);
+
+  // Hourly strip: the first N 3-hour blocks, as-is.
+  ForecastHour hours[FORECAST_HOURS_MAX];
+  int nh = 0;
+  for (JsonObject e : list) {
+    if (nh >= FORECAST_HOURS_MAX) break;
+    hours[nh].dt = e["dt"] | 0;
+    hours[nh].temp = e["main"]["temp"] | NAN;
+    hours[nh].pop = (uint8_t) ((e["pop"] | 0.0f) * 100.0f + 0.5f);
+    const char *icon = "";
+    int id = 0;
+    JsonArray w = e["weather"].as<JsonArray>();
+    if (!w.isNull() && w.size() > 0) { icon = w[0]["icon"] | ""; id = w[0]["id"] | 0; }
+    strncpy(hours[nh].icon, map_weather_icon_(icon, id), sizeof(hours[nh].icon) - 1);
+    hours[nh].icon[sizeof(hours[nh].icon) - 1] = '\0';
+    nh++;
+  }
+
+  // Daily outlook: fold the 3-hour blocks into per-day min/max + max pop, with
+  // the icon from the block nearest local noon (most representative of the day).
+  struct DayAcc {
+    long day;
+    float tmin, tmax;
+    uint8_t pop;
+    int32_t dt;
+    int best_noon;
+    char icon[20];
+  };
+  DayAcc acc[FORECAST_DAYS_MAX];
+  int na = 0;
+  for (JsonObject e : list) {
+    int32_t dt = e["dt"] | 0;
+    long local = (long) dt + tz;
+    long localDay = local / 86400;
+    int localHour = (int) ((local % 86400) / 3600);
+    float t = e["main"]["temp"] | NAN;
+    float tmin = e["main"]["temp_min"] | t;
+    float tmax = e["main"]["temp_max"] | t;
+    uint8_t pop = (uint8_t) ((e["pop"] | 0.0f) * 100.0f + 0.5f);
+    const char *icon = "";
+    int id = 0;
+    JsonArray w = e["weather"].as<JsonArray>();
+    if (!w.isNull() && w.size() > 0) { icon = w[0]["icon"] | ""; id = w[0]["id"] | 0; }
+
+    int idx = -1;
+    for (int i = 0; i < na; i++) {
+      if (acc[i].day == localDay) { idx = i; break; }
+    }
+    if (idx < 0) {
+      if (na >= FORECAST_DAYS_MAX) break;
+      idx = na++;
+      acc[idx].day = localDay;
+      acc[idx].tmin = tmin;
+      acc[idx].tmax = tmax;
+      acc[idx].pop = pop;
+      acc[idx].dt = dt;
+      acc[idx].best_noon = 99;
+      acc[idx].icon[0] = '\0';
+    } else {
+      if (std::isfinite(tmin) && (!std::isfinite(acc[idx].tmin) || tmin < acc[idx].tmin)) acc[idx].tmin = tmin;
+      if (std::isfinite(tmax) && (!std::isfinite(acc[idx].tmax) || tmax > acc[idx].tmax)) acc[idx].tmax = tmax;
+      if (pop > acc[idx].pop) acc[idx].pop = pop;
+    }
+    int noon = abs(localHour - 12);
+    if (noon < acc[idx].best_noon) {
+      acc[idx].best_noon = noon;
+      strncpy(acc[idx].icon, map_weather_icon_(icon, id), sizeof(acc[idx].icon) - 1);
+      acc[idx].icon[sizeof(acc[idx].icon) - 1] = '\0';
+    }
+  }
+
+  ForecastDay days[FORECAST_DAYS_MAX];
+  for (int i = 0; i < na; i++) {
+    days[i].dt = acc[i].dt;
+    days[i].temp_min = acc[i].tmin;
+    days[i].temp_max = acc[i].tmax;
+    days[i].pop = acc[i].pop;
+    strncpy(days[i].icon, acc[i].icon, sizeof(days[i].icon) - 1);
+    days[i].icon[sizeof(days[i].icon) - 1] = '\0';
+  }
+
+  if (weather_mutex_) xSemaphoreTake(weather_mutex_, portMAX_DELAY);
+  if (nh) memcpy(forecast_hours_, hours, sizeof(ForecastHour) * nh);
+  if (na) memcpy(forecast_days_, days, sizeof(ForecastDay) * na);
+  forecast_hours_count_ = nh;
+  forecast_days_count_ = na;
+  forecast_available_ = true;
+  forecast_updated_ms_ = millis();
+  forecast_error_.clear();
+  if (weather_mutex_) xSemaphoreGive(weather_mutex_);
+  ESP_LOGI(TAG, "forecast: free ok (%d blocks, %d days; body %u B, free heap %u)",
+           nh, na, (unsigned) body.size(), (unsigned) esp_get_free_heap_size());
+  return true;
+}
+
+std::string Actron485Api::build_forecast_json_(bool include_hourly, bool include_daily) {
+  JsonDocument doc;
+  auto root = doc.to<JsonObject>();
+
+  bool configured, available;
+  WeatherSource src;
+  unsigned long updated;
+  std::string error;
+  ForecastHour hours[FORECAST_HOURS_MAX];
+  ForecastDay days[FORECAST_DAYS_MAX];
+  int nh, nd;
+  if (weather_mutex_) xSemaphoreTake(weather_mutex_, portMAX_DELAY);
+  configured = !weather_api_key_.empty() && weather_location_set_;
+  available = forecast_available_;
+  src = weather_source_;
+  updated = forecast_updated_ms_;
+  error = forecast_error_;
+  nh = forecast_hours_count_;
+  nd = forecast_days_count_;
+  if (nh) memcpy(hours, forecast_hours_, sizeof(ForecastHour) * nh);
+  if (nd) memcpy(days, forecast_days_, sizeof(ForecastDay) * nd);
+  if (weather_mutex_) xSemaphoreGive(weather_mutex_);
+
+  if (!configured) {
+    root["available"] = false;
+    root["reason"] = "not_configured";
+    std::string out;
+    serializeJson(doc, out);
+    return out;
+  }
+  if (!available) {
+    root["available"] = false;
+    root["reason"] = "no_data";
+    if (!error.empty()) root["error"] = error;
+    std::string out;
+    serializeJson(doc, out);
+    return out;
+  }
+
+  root["available"] = true;
+  root["source"] = (src == WeatherSource::ONECALL) ? "onecall" : "openweather_free";
+  root["updated_at_ms"] = updated;
+  root["age_ms"] = (unsigned long) (millis() - updated);
+
+  if (include_daily && nd > 0) {
+    JsonObject today = root["today"].to<JsonObject>();
+    today["dt"] = days[0].dt;
+    if (std::isfinite(days[0].temp_min)) today["temp_min"] = days[0].temp_min; else today["temp_min"] = nullptr;
+    if (std::isfinite(days[0].temp_max)) today["temp_max"] = days[0].temp_max; else today["temp_max"] = nullptr;
+    today["pop"] = days[0].pop;
+    today["icon"] = days[0].icon;
+  }
+
+  if (include_hourly) {
+    JsonArray ha = root["hourly"].to<JsonArray>();
+    for (int i = 0; i < nh; i++) {
+      JsonObject o = ha.add<JsonObject>();
+      o["dt"] = hours[i].dt;
+      if (std::isfinite(hours[i].temp)) o["temp"] = hours[i].temp; else o["temp"] = nullptr;
+      o["pop"] = hours[i].pop;
+      o["icon"] = hours[i].icon;
+    }
+  }
+
+  if (include_daily) {
+    JsonArray da = root["daily"].to<JsonArray>();
+    for (int i = 0; i < nd; i++) {
+      JsonObject o = da.add<JsonObject>();
+      o["dt"] = days[i].dt;
+      if (std::isfinite(days[i].temp_min)) o["temp_min"] = days[i].temp_min; else o["temp_min"] = nullptr;
+      if (std::isfinite(days[i].temp_max)) o["temp_max"] = days[i].temp_max; else o["temp_max"] = nullptr;
+      o["pop"] = days[i].pop;
+      o["icon"] = days[i].icon;
+    }
+  }
+
+  std::string out;
+  serializeJson(doc, out);
+  return out;
+}
+
+std::string Actron485Api::build_forecast_json() { return build_forecast_json_(true, true); }
+std::string Actron485Api::build_forecast_hourly_json() { return build_forecast_json_(true, false); }
+std::string Actron485Api::build_forecast_daily_json() { return build_forecast_json_(false, true); }
+
+std::string Actron485Api::forecast_status_summary() {
+  bool configured, available;
+  WeatherSource src;
+  float tmin, tmax;
+  int nd;
+  std::string error;
+  if (weather_mutex_) xSemaphoreTake(weather_mutex_, portMAX_DELAY);
+  configured = !weather_api_key_.empty() && weather_location_set_;
+  available = forecast_available_;
+  src = weather_source_;
+  nd = forecast_days_count_;
+  tmin = nd > 0 ? forecast_days_[0].temp_min : NAN;
+  tmax = nd > 0 ? forecast_days_[0].temp_max : NAN;
+  error = forecast_error_;
+  if (weather_mutex_) xSemaphoreGive(weather_mutex_);
+
+  if (!configured) return "Not configured";
+  if (!available) {
+    if (!error.empty()) return "Error: " + error;
+    return "Waiting for data\xE2\x80\xA6";  // …
+  }
+
+  const char *srcname = (src == WeatherSource::ONECALL) ? "onecall" : "free";
+  char out[64];
+  if (std::isfinite(tmin) && std::isfinite(tmax)) {
+    // "Today 11.2–19.8°C · onecall" (– = U+2013, ° = U+00B0, · = U+00B7)
+    snprintf(out, sizeof(out), "Today %.1f\xE2\x80\x93%.1f\xC2\xB0""C \xC2\xB7 %s",
+             tmin, tmax, srcname);
+  } else {
+    snprintf(out, sizeof(out), "%d-day outlook \xC2\xB7 %s", nd, srcname);
+  }
   return std::string(out);
 }
 
@@ -604,6 +1082,9 @@ void Actron485Api::set_weather_api_key_runtime(const std::string &key) {
   trimmed = trimmed.substr(0, WEATHER_KEY_MAX);
   if (weather_mutex_) xSemaphoreTake(weather_mutex_, portMAX_DELAY);
   weather_api_key_ = trimmed;
+  // Re-detect the provider on the next forecast cycle — a new key may belong
+  // to a different OpenWeather plan (One Call 3.0 vs free tier).
+  weather_source_ = WeatherSource::UNKNOWN;
   if (weather_mutex_) xSemaphoreGive(weather_mutex_);
   this->save_settings_();
   ESP_LOGI(TAG, "Weather API key %s", trimmed.empty() ? "cleared" : "updated");
@@ -1194,6 +1675,18 @@ void Actron485ApiHandler::handleRequest(AsyncWebServerRequest *request) {
     handle_weather_(request);
     return;
   }
+  if (method == HTTP_GET && url == "/api/v1/forecast") {
+    handle_forecast_(request);
+    return;
+  }
+  if (method == HTTP_GET && url == "/api/v1/forecast/hourly") {
+    handle_forecast_hourly_(request);
+    return;
+  }
+  if (method == HTTP_GET && url == "/api/v1/forecast/daily") {
+    handle_forecast_daily_(request);
+    return;
+  }
   if (method == HTTP_GET && url == "/api/v1/bus") {
     handle_bus_(request);
     return;
@@ -1319,6 +1812,19 @@ void Actron485ApiHandler::handle_state_(AsyncWebServerRequest *request) {
 // 409). See build_weather_json for the shape.
 void Actron485ApiHandler::handle_weather_(AsyncWebServerRequest *request) {
   send_json_(request, 200, parent_->build_weather_json());
+}
+
+// GET /api/v1/forecast[/hourly|/daily] — last-known-good forecast, polled
+// server-side. Always 200; {"available": false, "reason": ...} until ready.
+// See build_forecast_json[_hourly|_daily] for the shapes.
+void Actron485ApiHandler::handle_forecast_(AsyncWebServerRequest *request) {
+  send_json_(request, 200, parent_->build_forecast_json());
+}
+void Actron485ApiHandler::handle_forecast_hourly_(AsyncWebServerRequest *request) {
+  send_json_(request, 200, parent_->build_forecast_hourly_json());
+}
+void Actron485ApiHandler::handle_forecast_daily_(AsyncWebServerRequest *request) {
+  send_json_(request, 200, parent_->build_forecast_daily_json());
 }
 
 void Actron485ApiHandler::handle_diagnostics_(AsyncWebServerRequest *request) {

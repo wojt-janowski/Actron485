@@ -102,6 +102,18 @@ class Actron485Api : public Component {
   // "18.7°C · Partly cloudy", "Waiting for data…", or "Not configured".
   std::string weather_status_summary();
 
+  // Serialized forecast snapshots for GET /api/v1/forecast[/hourly|/daily].
+  // Safe to call from the HTTP task — read cached values under the mutex.
+  // The consolidated form carries today's high/low, the hourly strip and the
+  // multi-day outlook; the subset forms exist so a wall screen can fetch only
+  // the payload it renders.
+  std::string build_forecast_json();         // today + hourly + daily
+  std::string build_forecast_hourly_json();  // hourly strip only
+  std::string build_forecast_daily_json();   // today + multi-day outlook
+
+  // Dashboard one-liner, e.g. "Today 11.2–19.8°C · onecall" / "Not configured".
+  std::string forecast_status_summary();
+
   // Write-path wrappers. In normal mode these delegate to the Actron485
   // controller. In demo mode they mutate only the simulator's state and
   // never touch the RS485 bus.
@@ -256,11 +268,55 @@ class Actron485Api : public Component {
   // usable reading. Empty once a fetch has succeeded. Set under the mutex.
   std::string weather_error_;
 
+  // ---- Forecast cache (GET /api/v1/forecast[/hourly|/daily]) ----
+  // Which OpenWeather product the configured key can use. Detected by probing
+  // One Call 3.0: a definitive "not subscribed" reply latches FREE; an
+  // invalid/inactive key stays UNKNOWN so it re-probes once the key activates.
+  // Reset to UNKNOWN whenever the key changes. Guarded by weather_mutex_.
+  enum class WeatherSource : uint8_t { UNKNOWN = 0, FREE = 1, ONECALL = 2 };
+  WeatherSource weather_source_{WeatherSource::UNKNOWN};
+
+  // Distilled forecast entries — only the fields the wall renders, so the
+  // ~30 KB upstream payload never lives in RAM beyond the (filtered) parse.
+  struct ForecastHour {
+    int32_t dt;        // unix UTC seconds
+    float   temp;      // °C
+    uint8_t pop;       // precipitation probability 0..100
+    char    icon[20];  // glyph name, e.g. "partly-cloudy-day"
+  };
+  struct ForecastDay {
+    int32_t dt;
+    float   temp_min;
+    float   temp_max;
+    uint8_t pop;
+    char    icon[20];
+  };
+  static constexpr int FORECAST_HOURS_MAX = 24;
+  static constexpr int FORECAST_DAYS_MAX = 8;
+  ForecastHour forecast_hours_[FORECAST_HOURS_MAX]{};
+  ForecastDay  forecast_days_[FORECAST_DAYS_MAX]{};
+  int forecast_hours_count_{0};
+  int forecast_days_count_{0};
+  bool forecast_available_{false};
+  unsigned long forecast_updated_ms_{0};
+  std::string forecast_error_;
+
   static void weather_task_trampoline_(void *arg);
   void weather_task_();
   bool fetch_weather_();  // true on a successful fetch + parse
   void set_weather_error_(const std::string &msg);
   bool parse_weather_response_(const std::string &body);
+
+  // Forecast fetch + parse. fetch_forecast_() picks the provider from
+  // weather_source_ (probing One Call 3.0 when UNKNOWN) and fills the forecast
+  // cache; in One Call mode it also refreshes the current-conditions cache.
+  bool http_get_(const char *url, std::string &body, int &status, size_t cap,
+                 std::string *err_name);
+  bool fetch_forecast_(const std::string &key, float lat, float lon);
+  bool parse_onecall_response_(const std::string &body);
+  bool parse_free_forecast_response_(const std::string &body);
+  void set_forecast_error_(const std::string &msg);
+  std::string build_forecast_json_(bool include_hourly, bool include_daily);
   // Maps OpenWeather's icon code (e.g. "10d") / condition id to a small
   // stable glyph name the wall can render. Provider-specific logic lives
   // here so swapping to a keyless provider later stays localized.
@@ -289,6 +345,9 @@ class Actron485ApiHandler : public AsyncWebHandler {
   void handle_state_(AsyncWebServerRequest *request);
   void handle_diagnostics_(AsyncWebServerRequest *request);
   void handle_weather_(AsyncWebServerRequest *request);
+  void handle_forecast_(AsyncWebServerRequest *request);
+  void handle_forecast_hourly_(AsyncWebServerRequest *request);
+  void handle_forecast_daily_(AsyncWebServerRequest *request);
   void handle_bus_(AsyncWebServerRequest *request);
   void handle_demo_(AsyncWebServerRequest *request, const std::string &body);
   void handle_power_(AsyncWebServerRequest *request, const std::string &body);
