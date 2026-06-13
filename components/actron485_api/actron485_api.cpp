@@ -10,8 +10,11 @@
 #include "esphome/components/actron485/utilities.h"
 #include "esphome/components/actron485/zone_fan.h"
 #include "esphome/components/actron485/zone_climate.h"
+#include "esphome/components/network/util.h"
 
 #include <esp_http_server.h>
+#include <esp_http_client.h>
+#include <esp_crt_bundle.h>
 #include <ArduinoJson.h>
 
 namespace esphome {
@@ -97,7 +100,262 @@ void Actron485Api::setup() {
   base->add_handler(handler_);
   this->load_zone_names_();
   this->load_settings_();
+  this->load_timezone_();
   ESP_LOGCONFIG(TAG, "Actron485 API mounted at /api/v1/* on port %u", base->get_port());
+
+  // Weather proxy. The fetch is blocking (DNS + TLS + transfer), so it runs
+  // on its own FreeRTOS task pinned to APP_CPU — keeping it off the ESPHome
+  // main loop, which the actron485 climate component shares to service
+  // time-critical slave-3 Modbus polls. The task only ever writes the cached
+  // weather_* fields (under weather_mutex_); the HTTP handler only reads them.
+  //
+  // The task always starts: the api key + location are entered at runtime via
+  // the dashboard (and may already be loaded from NVS above), so the task
+  // idles until both are present rather than requiring a reboot to activate.
+  weather_mutex_ = xSemaphoreCreateMutex();
+  xTaskCreatePinnedToCore(&Actron485Api::weather_task_trampoline_, "weather",
+                          8192, this, 1, &weather_task_handle_, APP_CPU_NUM);
+  ESP_LOGCONFIG(TAG, "Weather proxy task started (interval %u ms; configured=%s)",
+                (unsigned) weather_update_interval_ms_,
+                (!weather_api_key_.empty() && weather_location_set_) ? "yes" : "no (set key+location on dashboard)");
+}
+
+void Actron485Api::weather_task_trampoline_(void *arg) {
+  static_cast<Actron485Api *>(arg)->weather_task_();
+}
+
+void Actron485Api::weather_task_() {
+  for (;;) {
+    bool configured = this->weather_api_key_set() && this->weather_location_set();
+    if (configured && network::is_connected()) {
+      bool ok = this->fetch_weather_();
+      // Full interval on success; quick 60s retry on failure so a transient
+      // error, or a brand-new OpenWeather key that isn't active yet (returns
+      // HTTP 401 for up to ~2h), recovers without a full 15-min wait.
+      vTaskDelay(pdMS_TO_TICKS(ok ? weather_update_interval_ms_ : 60000));
+    } else {
+      // Not configured yet, or network not up — re-check soon so the first
+      // reading lands shortly after the key/location is entered (or WiFi
+      // associates) rather than a full interval later.
+      vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+  }
+}
+
+void Actron485Api::set_weather_error_(const std::string &msg) {
+  if (weather_mutex_) xSemaphoreTake(weather_mutex_, portMAX_DELAY);
+  weather_error_ = msg;
+  if (weather_mutex_) xSemaphoreGive(weather_mutex_);
+}
+
+bool Actron485Api::fetch_weather_() {
+  // Snapshot the runtime config under the mutex — the dashboard/API can
+  // mutate the key + location from another task at any time.
+  std::string key;
+  float lat, lon;
+  if (weather_mutex_) xSemaphoreTake(weather_mutex_, portMAX_DELAY);
+  key = weather_api_key_;
+  lat = weather_lat_;
+  lon = weather_lon_;
+  if (weather_mutex_) xSemaphoreGive(weather_mutex_);
+  if (key.empty()) return false;
+
+  char url[256];
+  snprintf(url, sizeof(url),
+           "https://api.openweathermap.org/data/2.5/weather"
+           "?lat=%.4f&lon=%.4f&units=metric&appid=%s",
+           lat, lon, key.c_str());
+
+  // ESP-IDF HTTP client. TLS is validated against the firmware's bundled CA
+  // set (esp_crt_bundle) — no per-host cert to maintain. esp_http_client is
+  // always available regardless of the arduino/esp-idf framework split.
+  esp_http_client_config_t cfg = {};
+  cfg.url = url;
+  cfg.timeout_ms = 8000;
+  cfg.crt_bundle_attach = esp_crt_bundle_attach;
+  cfg.disable_auto_redirect = false;
+  esp_http_client_handle_t client = esp_http_client_init(&cfg);
+  if (client == nullptr) {
+    ESP_LOGW(TAG, "weather: client init failed");
+    this->set_weather_error_("internal error");
+    return false;
+  }
+
+  esp_err_t err = esp_http_client_open(client, 0);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "weather: connect failed: %s (keeping last-known-good)",
+             esp_err_to_name(err));
+    this->set_weather_error_(std::string("network/TLS error (") + esp_err_to_name(err) + ")");
+    esp_http_client_cleanup(client);
+    return false;
+  }
+  esp_http_client_fetch_headers(client);
+  int status = esp_http_client_get_status_code(client);
+  ESP_LOGI(TAG, "weather: HTTP %d", status);
+  if (status != 200) {
+    // 401 here almost always means a brand-new key that isn't active yet —
+    // OpenWeather takes up to ~2h to activate. The task will retry in 60s.
+    ESP_LOGW(TAG, "weather: HTTP %d (keeping last-known-good)", status);
+    if (status == 401) {
+      this->set_weather_error_("HTTP 401 - check API key (new keys take up to ~2h to activate)");
+    } else {
+      char m[40];
+      snprintf(m, sizeof(m), "HTTP %d from weather API", status);
+      this->set_weather_error_(m);
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    return false;
+  }
+
+  std::string body;
+  char buf[512];
+  int r;
+  while ((r = esp_http_client_read(client, buf, sizeof(buf))) > 0) {
+    body.append(buf, (size_t) r);
+    if (body.size() > 8192) break;  // safety cap — the payload is ~500 bytes
+  }
+  esp_http_client_close(client);
+  esp_http_client_cleanup(client);
+
+  if (this->parse_weather_response_(body)) {
+    ESP_LOGI(TAG, "weather: updated temp=%.1f cond=%s icon=%s",
+             weather_temp_, weather_condition_.c_str(), weather_icon_.c_str());
+    return true;
+  }
+  ESP_LOGW(TAG, "weather: response parse failed (keeping last-known-good)");
+  this->set_weather_error_("unexpected response from weather API");
+  return false;
+}
+
+bool Actron485Api::parse_weather_response_(const std::string &body) {
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) return false;
+  if (!doc["main"]["temp"].is<float>()) return false;
+
+  float temp = doc["main"]["temp"].as<float>();
+  float humidity = doc["main"]["humidity"].is<float>()
+                       ? doc["main"]["humidity"].as<float>()
+                       : NAN;
+  const char *condition = "";
+  const char *owm_icon = "";
+  int owm_id = 0;
+  JsonArray w = doc["weather"].as<JsonArray>();
+  if (!w.isNull() && w.size() > 0) {
+    JsonObject w0 = w[0];
+    condition = w0["main"] | "";
+    owm_icon = w0["icon"] | "";
+    owm_id = w0["id"] | 0;
+  }
+  const char *glyph = map_weather_icon_(owm_icon, owm_id);
+
+  if (weather_mutex_) xSemaphoreTake(weather_mutex_, portMAX_DELAY);
+  weather_temp_ = temp;
+  weather_humidity_ = humidity;
+  weather_condition_ = condition;
+  weather_icon_ = glyph;
+  weather_updated_ms_ = millis();
+  weather_available_ = true;
+  weather_error_.clear();
+  if (weather_mutex_) xSemaphoreGive(weather_mutex_);
+  return true;
+}
+
+const char *Actron485Api::map_weather_icon_(const char *owm_icon, int owm_id) {
+  (void) owm_id;
+  if (owm_icon == nullptr || strlen(owm_icon) < 2) return "cloudy";
+  bool night = (strlen(owm_icon) >= 3 && owm_icon[2] == 'n');
+  if (!strncmp(owm_icon, "01", 2)) return night ? "clear-night" : "clear-day";
+  if (!strncmp(owm_icon, "02", 2)) return night ? "partly-cloudy-night" : "partly-cloudy-day";
+  if (!strncmp(owm_icon, "03", 2)) return "cloudy";
+  if (!strncmp(owm_icon, "04", 2)) return "cloudy";
+  if (!strncmp(owm_icon, "09", 2)) return "rain";
+  if (!strncmp(owm_icon, "10", 2)) return "rain";
+  if (!strncmp(owm_icon, "11", 2)) return "storm";
+  if (!strncmp(owm_icon, "13", 2)) return "snow";
+  if (!strncmp(owm_icon, "50", 2)) return "fog";
+  return "cloudy";
+}
+
+std::string Actron485Api::build_weather_json() {
+  JsonDocument doc;
+  auto root = doc.to<JsonObject>();
+
+  bool configured, available;
+  float temp, humidity;
+  std::string condition, icon, error;
+  unsigned long updated;
+  if (weather_mutex_) xSemaphoreTake(weather_mutex_, portMAX_DELAY);
+  configured = !weather_api_key_.empty() && weather_location_set_;
+  available = weather_available_;
+  temp = weather_temp_;
+  humidity = weather_humidity_;
+  condition = weather_condition_;
+  icon = weather_icon_;
+  updated = weather_updated_ms_;
+  error = weather_error_;
+  if (weather_mutex_) xSemaphoreGive(weather_mutex_);
+
+  if (!configured) {
+    root["available"] = false;
+    root["reason"] = "not_configured";
+    std::string out;
+    serializeJson(doc, out);
+    return out;
+  }
+
+  if (!available) {
+    root["available"] = false;
+    root["reason"] = "no_data";  // configured, but no successful fetch yet
+    if (!error.empty()) root["error"] = error;
+    std::string out;
+    serializeJson(doc, out);
+    return out;
+  }
+
+  root["available"] = true;
+  root["temp"] = temp;
+  if (std::isfinite(humidity)) {
+    root["humidity"] = humidity;
+  } else {
+    root["humidity"] = nullptr;
+  }
+  root["condition"] = condition;
+  root["icon"] = icon;
+  root["source"] = "openweather";
+  root["updated_at_ms"] = updated;
+  root["age_ms"] = (unsigned long) (millis() - updated);
+
+  std::string out;
+  serializeJson(doc, out);
+  return out;
+}
+
+std::string Actron485Api::weather_status_summary() {
+  bool configured, available;
+  float temp;
+  std::string condition, error;
+  if (weather_mutex_) xSemaphoreTake(weather_mutex_, portMAX_DELAY);
+  configured = !weather_api_key_.empty() && weather_location_set_;
+  available = weather_available_;
+  temp = weather_temp_;
+  condition = weather_condition_;
+  error = weather_error_;
+  if (weather_mutex_) xSemaphoreGive(weather_mutex_);
+
+  if (!configured) return "Not configured";
+  // Last-known-good wins even if a later poll failed; only surface the error
+  // when we have nothing to show. Before the first attempt error is empty.
+  if (!available) {
+    if (!error.empty()) return "Error: " + error;
+    return "Waiting for data\xE2\x80\xA6";  // …
+  }
+
+  char out[64];
+  // "18.7°C · Partly cloudy" (° = U+00B0, · = U+00B7, both UTF-8 literals)
+  snprintf(out, sizeof(out), "%.1f\xC2\xB0""C \xC2\xB7 %s", temp,
+           condition.empty() ? "—" : condition.c_str());
+  return std::string(out);
 }
 
 void Actron485Api::load_zone_names_() {
@@ -128,7 +386,7 @@ void Actron485Api::save_zone_names_() {
 }
 
 void Actron485Api::load_settings_() {
-  uint32_t hash = fnv1_hash(std::string("actron485_api_settings_v1"));
+  uint32_t hash = fnv1_hash(std::string("actron485_api_settings_v2"));
   settings_pref_ = global_preferences->make_preference<SettingsBlob>(hash);
   settings_loaded_ = true;
 
@@ -160,6 +418,18 @@ void Actron485Api::load_settings_() {
     auth_token_ = std::string(blob.api_key);
     ESP_LOGCONFIG(TAG, "  Loaded API key from NVS (override yaml)");
   }
+  if (blob.has_weather_key) {
+    blob.weather_api_key[WEATHER_KEY_MAX] = '\0';  // defensive
+    weather_api_key_ = std::string(blob.weather_api_key);
+  }
+  if (blob.weather_location_set) {
+    weather_lat_ = blob.weather_lat;
+    weather_lon_ = blob.weather_lon;
+    weather_location_set_ = true;
+  }
+  ESP_LOGCONFIG(TAG, "  Weather: key=%s location=%s",
+                blob.has_weather_key ? "set" : "unset",
+                blob.weather_location_set ? "set" : "unset");
   settings_act_as_slave_3_ = blob.act_as_slave_3 != 0;
   settings_logging_mode_   = blob.logging_mode;
   // Push into the live controller. printOutMode is a public enum field.
@@ -194,8 +464,57 @@ void Actron485Api::save_settings_() {
   size_t n = std::min(auth_token_.size(), API_KEY_MAX);
   memcpy(blob.api_key, auth_token_.data(), n);
   blob.api_key[n] = '\0';
+  blob.has_weather_key = weather_api_key_.empty() ? 0 : 1;
+  size_t wn = std::min(weather_api_key_.size(), WEATHER_KEY_MAX);
+  memcpy(blob.weather_api_key, weather_api_key_.data(), wn);
+  blob.weather_api_key[wn] = '\0';
+  blob.weather_location_set = weather_location_set_ ? 1 : 0;
+  blob.weather_lat = weather_lat_;
+  blob.weather_lon = weather_lon_;
   settings_pref_.save(&blob);
   global_preferences->sync();
+}
+
+void Actron485Api::load_timezone_() {
+  // Own NVS slot, independent of the versioned SettingsBlob, so editing the
+  // timezone never orphans the api_key / weather config.
+  uint32_t hash = fnv1_hash(std::string("actron485_api_timezone_v1"));
+  timezone_pref_ = global_preferences->make_preference<TimezoneBlob>(hash);
+  TimezoneBlob blob{};
+  if (timezone_pref_.load(&blob)) {
+    blob.tz[TIMEZONE_MAX] = '\0';  // defensive
+    if (blob.tz[0] != '\0') {
+      timezone_ = std::string(blob.tz);
+    }
+  }
+  ESP_LOGCONFIG(TAG, "  Timezone: %s", timezone_.c_str());
+}
+
+void Actron485Api::save_timezone_() {
+  TimezoneBlob blob{};
+  size_t n = std::min(timezone_.size(), TIMEZONE_MAX);
+  memcpy(blob.tz, timezone_.data(), n);
+  blob.tz[n] = '\0';
+  timezone_pref_.save(&blob);
+  global_preferences->sync();
+}
+
+std::string Actron485Api::timezone() {
+  return timezone_;
+}
+
+void Actron485Api::set_timezone_runtime(const std::string &tz) {
+  std::string trimmed = tz;
+  const char *ws = " \t\r\n";
+  size_t b = trimmed.find_first_not_of(ws);
+  size_t e = trimmed.find_last_not_of(ws);
+  trimmed = (b == std::string::npos) ? "" : trimmed.substr(b, e - b + 1);
+  if (trimmed.empty()) {
+    return;  // never store an empty TZ — keep the last good value
+  }
+  timezone_ = trimmed.substr(0, TIMEZONE_MAX);
+  this->save_timezone_();
+  ESP_LOGI(TAG, "Timezone set to %s", timezone_.c_str());
 }
 
 void Actron485Api::set_api_key_runtime(const std::string &key) {
@@ -232,6 +551,77 @@ void Actron485Api::set_logging_mode_runtime(int mode) {
   this->save_settings_();
 }
 
+// ---- Weather runtime config (dashboard + PATCH /api/v1/settings) ----
+// All four fields are read by the weather task on another core, so config
+// writes/reads are guarded by weather_mutex_. save_settings_() is called
+// after releasing the lock (it only reads, on this task).
+
+void Actron485Api::set_weather_api_key_runtime(const std::string &key) {
+  // Trim surrounding whitespace — pasting into the dashboard field often
+  // drags a trailing space/newline, which would corrupt the appid and 401.
+  std::string trimmed = key;
+  const char *ws = " \t\r\n";
+  size_t b = trimmed.find_first_not_of(ws);
+  size_t e = trimmed.find_last_not_of(ws);
+  trimmed = (b == std::string::npos) ? "" : trimmed.substr(b, e - b + 1);
+  trimmed = trimmed.substr(0, WEATHER_KEY_MAX);
+  if (weather_mutex_) xSemaphoreTake(weather_mutex_, portMAX_DELAY);
+  weather_api_key_ = trimmed;
+  if (weather_mutex_) xSemaphoreGive(weather_mutex_);
+  this->save_settings_();
+  ESP_LOGI(TAG, "Weather API key %s", trimmed.empty() ? "cleared" : "updated");
+}
+
+void Actron485Api::set_weather_location_runtime(float lat, float lon) {
+  bool valid = std::isfinite(lat) && std::isfinite(lon) &&
+               lat >= -90.0f && lat <= 90.0f &&
+               lon >= -180.0f && lon <= 180.0f &&
+               !(lat == 0.0f && lon == 0.0f);
+  if (weather_mutex_) xSemaphoreTake(weather_mutex_, portMAX_DELAY);
+  if (valid) {
+    weather_lat_ = lat;
+    weather_lon_ = lon;
+    weather_location_set_ = true;
+  } else {
+    weather_location_set_ = false;
+  }
+  if (weather_mutex_) xSemaphoreGive(weather_mutex_);
+  this->save_settings_();
+  if (valid) {
+    ESP_LOGI(TAG, "Weather location set lat=%.4f lon=%.4f", lat, lon);
+  } else {
+    ESP_LOGW(TAG, "Weather location cleared (lat=%.4f lon=%.4f out of range)", lat, lon);
+  }
+}
+
+bool Actron485Api::weather_api_key_set() {
+  if (weather_mutex_) xSemaphoreTake(weather_mutex_, portMAX_DELAY);
+  bool r = !weather_api_key_.empty();
+  if (weather_mutex_) xSemaphoreGive(weather_mutex_);
+  return r;
+}
+
+bool Actron485Api::weather_location_set() {
+  if (weather_mutex_) xSemaphoreTake(weather_mutex_, portMAX_DELAY);
+  bool r = weather_location_set_;
+  if (weather_mutex_) xSemaphoreGive(weather_mutex_);
+  return r;
+}
+
+float Actron485Api::weather_latitude() {
+  if (weather_mutex_) xSemaphoreTake(weather_mutex_, portMAX_DELAY);
+  float r = weather_lat_;
+  if (weather_mutex_) xSemaphoreGive(weather_mutex_);
+  return r;
+}
+
+float Actron485Api::weather_longitude() {
+  if (weather_mutex_) xSemaphoreTake(weather_mutex_, portMAX_DELAY);
+  float r = weather_lon_;
+  if (weather_mutex_) xSemaphoreGive(weather_mutex_);
+  return r;
+}
+
 std::string Actron485Api::build_settings_json() {
   JsonDocument doc;
   auto root = doc.to<JsonObject>();
@@ -241,6 +631,17 @@ std::string Actron485Api::build_settings_json() {
   // Clients that need to verify they hold the right key should just
   // attempt an authenticated request and check for a 200.
   root["api_key_set"] = !auth_token_.empty();
+  root["timezone"] = timezone_;
+  // Weather config (key masked, like api_key). Lat/lon are echoed so the
+  // dashboard/app can show the configured location.
+  root["weather_api_key_set"] = this->weather_api_key_set();
+  if (this->weather_location_set()) {
+    root["weather_latitude"] = this->weather_latitude();
+    root["weather_longitude"] = this->weather_longitude();
+  } else {
+    root["weather_latitude"] = nullptr;
+    root["weather_longitude"] = nullptr;
+  }
   std::string out;
   serializeJson(doc, out);
   return out;
@@ -752,6 +1153,10 @@ void Actron485ApiHandler::handleRequest(AsyncWebServerRequest *request) {
     handle_diagnostics_(request);
     return;
   }
+  if (method == HTTP_GET && url == "/api/v1/weather") {
+    handle_weather_(request);
+    return;
+  }
   if (method == HTTP_GET && url == "/api/v1/bus") {
     handle_bus_(request);
     return;
@@ -824,6 +1229,7 @@ void Actron485ApiHandler::handle_info_(AsyncWebServerRequest *request) {
   root["zone_count"] = 8;
   root["uptime_ms"] = (unsigned long) millis();
   root["demo"] = parent_->demo_mode();
+  root["timezone"] = parent_->timezone();
   // Static zone metadata — safe to return even when the RS485 bus is silent.
   JsonArray zones = root["zones"].to<JsonArray>();
   for (int i = 1; i <= 8; i++) {
@@ -868,6 +1274,14 @@ void Actron485ApiHandler::handle_state_(AsyncWebServerRequest *request) {
     return;
   }
   send_json_(request, 200, parent_->build_state_json());
+}
+
+// GET /api/v1/weather — last-known-good outdoor weather, polled server-side
+// from OpenWeather. Always 200: {"available": false, ...} until configured
+// and a first fetch succeeds (friendlier for the wall's fast poller than a
+// 409). See build_weather_json for the shape.
+void Actron485ApiHandler::handle_weather_(AsyncWebServerRequest *request) {
+  send_json_(request, 200, parent_->build_weather_json());
 }
 
 void Actron485ApiHandler::handle_diagnostics_(AsyncWebServerRequest *request) {
@@ -1151,6 +1565,9 @@ void Actron485ApiHandler::handle_settings_patch_(AsyncWebServerRequest *request,
   if (doc["api_key"].is<const char *>()) {
     parent_->set_api_key_runtime(doc["api_key"].as<const char *>());
   }
+  if (doc["timezone"].is<const char *>()) {
+    parent_->set_timezone_runtime(doc["timezone"].as<const char *>());
+  }
   if (doc["act_as_slave_3"].is<bool>()) {
     parent_->set_act_as_slave_3_runtime(doc["act_as_slave_3"].as<bool>());
   }
@@ -1158,6 +1575,21 @@ void Actron485ApiHandler::handle_settings_patch_(AsyncWebServerRequest *request,
     int m = doc["logging_mode"].as<int>();
     if (m < 0 || m > 5) { send_error_(request, 400, "invalid_logging_mode"); return; }
     parent_->set_logging_mode_runtime(m);
+  }
+  // Weather. weather_api_key: empty string disables. Latitude + longitude
+  // must be supplied together; out-of-range clears the location.
+  if (doc["weather_api_key"].is<const char *>()) {
+    parent_->set_weather_api_key_runtime(doc["weather_api_key"].as<const char *>());
+  }
+  bool has_lat = doc["weather_latitude"].is<float>();
+  bool has_lon = doc["weather_longitude"].is<float>();
+  if (has_lat || has_lon) {
+    if (!(has_lat && has_lon)) {
+      send_error_(request, 400, "lat_lon_must_be_paired");
+      return;
+    }
+    parent_->set_weather_location_runtime(doc["weather_latitude"].as<float>(),
+                                          doc["weather_longitude"].as<float>());
   }
   send_json_(request, 200, parent_->build_settings_json());
 }

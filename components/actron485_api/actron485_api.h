@@ -1,6 +1,11 @@
 #pragma once
 
 #include <string>
+#include <cmath>
+
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
 
 #include "esphome/core/component.h"
 #include "esphome/core/preferences.h"
@@ -20,6 +25,31 @@ class Actron485Api : public Component {
   void set_sensor_stale_timeout_ms(uint32_t ms) { sensor_stale_timeout_ms_ = ms; }
   void set_demo_mode(bool on) { demo_mode_ = on; }
   bool demo_mode() const { return demo_mode_; }
+
+  // ---- Weather proxy ----
+  // Poll interval is the only compile-time tunable (actron.yaml). The API
+  // key and the home location are entered at runtime via the dashboard and
+  // persisted to NVS, mirroring the auth api_key pattern.
+  void set_weather_update_interval_ms(uint32_t ms) { weather_update_interval_ms_ = ms; }
+
+  // Runtime setters (dashboard + PATCH /api/v1/settings). Both persist to
+  // NVS. Empty key disables weather; lat/lon outside valid ranges clears
+  // the location. Thread-safe — guarded against the weather task.
+  void set_weather_api_key_runtime(const std::string &key);
+  void set_weather_location_runtime(float lat, float lon);
+
+  // Read-backs for the dashboard widgets / GET /api/v1/settings.
+  bool weather_api_key_set();
+  bool weather_location_set();
+  float weather_latitude();
+  float weather_longitude();
+
+  // Site timezone as a POSIX TZ string (e.g. "AEST-10AEDT,M10.1.0,M4.1.0/3").
+  // Bridge-authoritative: served in /api/v1/info so every wall panel inherits
+  // it. The DST rule is embedded in the string, so it auto-adjusts. Persisted
+  // in its own NVS slot so the weather/api_key settings blob is untouched.
+  std::string timezone();
+  void set_timezone_runtime(const std::string &tz);
 
   void setup() override;
   void loop() override;
@@ -57,6 +87,14 @@ class Actron485Api : public Component {
 
   // Serialized state snapshot used by both GET /state and (future) streaming.
   std::string build_state_json();
+
+  // Serialized last-known-good weather snapshot for GET /api/v1/weather.
+  // Safe to call from the HTTP task — reads cached values under the mutex.
+  std::string build_weather_json();
+
+  // Human-readable one-liner for the ESPHome dashboard status sensor, e.g.
+  // "18.7°C · Partly cloudy", "Waiting for data…", or "Not configured".
+  std::string weather_status_summary();
 
   // Write-path wrappers. In normal mode these delegate to the Actron485
   // controller. In demo mode they mutate only the simulator's state and
@@ -146,16 +184,27 @@ class Actron485Api : public Component {
   // act_as_slave_3_runtime_ / logging_mode_runtime_ are tri-state: -1
   // means "no override, use yaml". 0/1/2/... are the active values.
   static constexpr uint32_t kSettingsMagic   = 0xAC773501;
-  static constexpr uint32_t kSettingsVersion = 1;
-  static constexpr size_t   API_KEY_MAX     = 63;
+  // v2 adds the weather api key + lat/lon. The NVS slot key is versioned
+  // (`..._settings_v2`), so a v1 device upgrading simply falls back to yaml
+  // defaults for the non-weather settings (act_as_slave_3 also defaults via
+  // yaml; api_key was unset) — acceptable, and avoids unaligned-float
+  // migration of the old blob.
+  static constexpr uint32_t kSettingsVersion  = 2;
+  static constexpr size_t   API_KEY_MAX      = 63;
+  static constexpr size_t   WEATHER_KEY_MAX  = 63;
   struct SettingsBlob {
     uint32_t magic;
     uint32_t version;
     uint8_t  act_as_slave_3;       // 0=off, 1=on
     uint8_t  logging_mode;         // 0..5 — same enum as yaml `logging_mode`
     uint8_t  has_api_key;          // 0=none, 1=use api_key field
-    uint8_t  _pad;
+    uint8_t  has_weather_key;      // 0=none, 1=use weather_api_key field
+    uint8_t  weather_location_set; // 0=unset, 1=lat/lon valid
+    uint8_t  _pad[3];              // keep api_key (and later floats) aligned
     char     api_key[API_KEY_MAX + 1];
+    char     weather_api_key[WEATHER_KEY_MAX + 1];
+    float    weather_lat;
+    float    weather_lon;
   } __attribute__((packed));
   ESPPreferenceObject settings_pref_;
   bool settings_loaded_{false};
@@ -165,6 +214,51 @@ class Actron485Api : public Component {
   int  settings_logging_mode_{1};  // 1 = STATUS, ESPHome default
   void load_settings_();
   void save_settings_();
+
+  // Site timezone (POSIX TZ string). Stored in its own NVS slot so changing it
+  // never disturbs the versioned SettingsBlob (api_key / weather). Defaults to
+  // Sydney with DST when nothing is persisted.
+  static constexpr size_t TIMEZONE_MAX = 47;
+  struct TimezoneBlob {
+    char tz[TIMEZONE_MAX + 1];
+  };
+  ESPPreferenceObject timezone_pref_;
+  std::string timezone_{"AEST-10AEDT,M10.1.0,M4.1.0/3"};
+  void load_timezone_();
+  void save_timezone_();
+
+  // ---- Weather proxy state ----
+  // The fetch runs on a dedicated FreeRTOS task, never on loop(): a
+  // blocking HTTPS GET would stall the main loop and, with the slave-3
+  // responder active, risk dropping AMIB Modbus polls. loop()/the HTTP
+  // handler only ever read the cached fields below, under weather_mutex_.
+  std::string weather_api_key_;
+  float weather_lat_{0.0f};
+  float weather_lon_{0.0f};
+  bool  weather_location_set_{false};
+  uint32_t weather_update_interval_ms_{900000};  // 15 min default
+
+  SemaphoreHandle_t weather_mutex_{nullptr};
+  TaskHandle_t weather_task_handle_{nullptr};
+  bool weather_available_{false};
+  float weather_temp_{NAN};
+  float weather_humidity_{NAN};
+  std::string weather_condition_;
+  std::string weather_icon_;
+  unsigned long weather_updated_ms_{0};
+  // Last fetch error, surfaced on the dashboard / endpoint when there is no
+  // usable reading. Empty once a fetch has succeeded. Set under the mutex.
+  std::string weather_error_;
+
+  static void weather_task_trampoline_(void *arg);
+  void weather_task_();
+  bool fetch_weather_();  // true on a successful fetch + parse
+  void set_weather_error_(const std::string &msg);
+  bool parse_weather_response_(const std::string &body);
+  // Maps OpenWeather's icon code (e.g. "10d") / condition id to a small
+  // stable glyph name the wall can render. Provider-specific logic lives
+  // here so swapping to a keyless provider later stays localized.
+  static const char *map_weather_icon_(const char *owm_icon, int owm_id);
 };
 
 class Actron485ApiHandler : public AsyncWebHandler {
@@ -188,6 +282,7 @@ class Actron485ApiHandler : public AsyncWebHandler {
   void handle_info_(AsyncWebServerRequest *request);
   void handle_state_(AsyncWebServerRequest *request);
   void handle_diagnostics_(AsyncWebServerRequest *request);
+  void handle_weather_(AsyncWebServerRequest *request);
   void handle_bus_(AsyncWebServerRequest *request);
   void handle_demo_(AsyncWebServerRequest *request, const std::string &body);
   void handle_power_(AsyncWebServerRequest *request, const std::string &body);

@@ -7,6 +7,10 @@ CONF_CLIMATE_ID = "climate_id"
 CONF_AUTH_TOKEN = "auth_token"
 CONF_SENSOR_STALE_TIMEOUT = "sensor_stale_timeout"
 CONF_DEMO_MODE = "demo_mode"
+# Weather: the API key and location are entered at runtime via the web
+# dashboard (and POST /api/v1/settings), persisted to NVS — NOT compile-time
+# secrets. Only the poll interval is a compile-time tunable.
+CONF_WEATHER_UPDATE_INTERVAL = "weather_update_interval"
 
 AUTO_LOAD = ["web_server_base"]
 DEPENDENCIES = ["web_server_base", "climate"]
@@ -33,6 +37,12 @@ CONFIG_SCHEMA = cv.Schema(
         # RS485 writes so the firmware can run safely on a bench T-CAN485
         # with no bus connection. Intended for mobile app end-to-end tests.
         cv.Optional(CONF_DEMO_MODE, default=False): cv.boolean,
+        # How often the bridge re-polls OpenWeather. The API key + location
+        # are set at runtime via the dashboard; until both are present the
+        # endpoint reports {"available": false}.
+        cv.Optional(
+            CONF_WEATHER_UPDATE_INTERVAL, default="15min"
+        ): cv.positive_time_period_milliseconds,
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -49,6 +59,10 @@ async def to_code(config):
 
     cg.add(var.set_sensor_stale_timeout_ms(config[CONF_SENSOR_STALE_TIMEOUT]))
     cg.add(var.set_demo_mode(config[CONF_DEMO_MODE]))
+
+    cg.add(
+        var.set_weather_update_interval_ms(config[CONF_WEATHER_UPDATE_INTERVAL])
+    )
 
     # Pulled in by ESPHome's json component transitively, but declare
     # explicitly to make the dependency obvious and pin a major version.
