@@ -1,18 +1,21 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.components import web_server_base
+from esphome.components import time, web_server_base
 from esphome.const import CONF_ID
 
 CONF_CLIMATE_ID = "climate_id"
 CONF_AUTH_TOKEN = "auth_token"
 CONF_SENSOR_STALE_TIMEOUT = "sensor_stale_timeout"
 CONF_DEMO_MODE = "demo_mode"
+# Bridge clock for the scheduler. Optional — without it the scheduler simply
+# never fires (it refuses to act on an unsynced/absent clock).
+CONF_TIME_ID = "time_id"
 # Weather: the API key and location are entered at runtime via the web
 # dashboard (and POST /api/v1/settings), persisted to NVS — NOT compile-time
 # secrets. Only the poll interval is a compile-time tunable.
 CONF_WEATHER_UPDATE_INTERVAL = "weather_update_interval"
 
-AUTO_LOAD = ["web_server_base"]
+AUTO_LOAD = ["web_server_base", "time"]
 DEPENDENCIES = ["web_server_base", "climate"]
 CODEOWNERS = ["@wojt-janowski"]
 
@@ -26,6 +29,7 @@ CONFIG_SCHEMA = cv.Schema(
     {
         cv.GenerateID(): cv.declare_id(Actron485Api),
         cv.Required(CONF_CLIMATE_ID): cv.use_id(Actron485Climate),
+        cv.Optional(CONF_TIME_ID): cv.use_id(time.RealTimeClock),
         cv.Optional(CONF_AUTH_TOKEN): cv.string_strict,
         # Auto-release wall-controller role for a zone if no
         # /temperature POST is received within this window. Set to 0 to
@@ -53,6 +57,10 @@ async def to_code(config):
 
     climate = await cg.get_variable(config[CONF_CLIMATE_ID])
     cg.add(var.set_climate(climate))
+
+    if CONF_TIME_ID in config:
+        rtc = await cg.get_variable(config[CONF_TIME_ID])
+        cg.add(var.set_time(rtc))
 
     if CONF_AUTH_TOKEN in config:
         cg.add(var.set_auth_token(config[CONF_AUTH_TOKEN]))

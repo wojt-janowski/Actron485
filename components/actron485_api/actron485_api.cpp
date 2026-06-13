@@ -102,6 +102,7 @@ void Actron485Api::setup() {
   this->load_zone_names_();
   this->load_settings_();
   this->load_timezone_();
+  this->scheduler_.setup();
   ESP_LOGCONFIG(TAG, "Actron485 API mounted at /api/v1/* on port %u", base->get_port());
 
   // Weather proxy. The fetch is blocking (DNS + TLS + transfer), so it runs
@@ -1427,6 +1428,10 @@ void Actron485Api::note_zone_temperature_update(uint8_t zone) {
 }
 
 void Actron485Api::loop() {
+  // Tick the scheduler first — it self-throttles to ~30 s and must run in demo
+  // mode too (apply_* honour the simulator). Kept above the early-returns below.
+  this->scheduler_.loop();
+
   if (demo_mode_) {
     this->demo_tick_();
     return;  // nothing else to do — the real bus isn't in play
@@ -1658,6 +1663,9 @@ void Actron485ApiHandler::handleRequest(AsyncWebServerRequest *request) {
     send_error_(request, 401, "unauthorized");
     return;
   }
+
+  // Scheduler / away / time routes (self-contained, defined at end of file).
+  if (this->handle_scheduler_routes_(request, method, url)) return;
 
   if (method == HTTP_GET && url == "/api/v1/info") {
     handle_info_(request);
@@ -2135,6 +2143,184 @@ void Actron485ApiHandler::handle_settings_patch_(AsyncWebServerRequest *request,
                                           doc["weather_longitude"].as<float>());
   }
   send_json_(request, 200, parent_->build_settings_json());
+}
+
+// ---- Scheduler input accessors (mutex-encapsulated) -------------------------
+// The weather task owns weather_*/forecast_* behind weather_mutex_. These give
+// the scheduler a safe, typed peek without it reaching into the structs or
+// spawning its own access path. Return false = "no usable reading".
+bool Actron485Api::weather_current_temp(float &out) {
+  bool ok = false;
+  if (weather_mutex_) xSemaphoreTake(weather_mutex_, portMAX_DELAY);
+  if (weather_available_ && !std::isnan(weather_temp_)) {
+    out = weather_temp_;
+    ok = true;
+  }
+  if (weather_mutex_) xSemaphoreGive(weather_mutex_);
+  return ok;
+}
+
+bool Actron485Api::forecast_today(float &temp_min, float &temp_max, int &pop) {
+  bool ok = false;
+  if (weather_mutex_) xSemaphoreTake(weather_mutex_, portMAX_DELAY);
+  if (forecast_available_ && forecast_days_count_ > 0) {
+    temp_min = forecast_days_[0].temp_min;
+    temp_max = forecast_days_[0].temp_max;
+    pop = forecast_days_[0].pop;
+    ok = true;
+  }
+  if (weather_mutex_) xSemaphoreGive(weather_mutex_);
+  return ok;
+}
+
+// ---- Scheduler / away / time routes -----------------------------------------
+// Self-contained dispatcher, deliberately placed at the end of the file (well
+// away from the forecast handler region) to keep merge surface minimal. Auth
+// has already been enforced by the caller. Returns true once it has handled
+// (and responded to) the request; false lets the main ladder try other routes.
+bool Actron485ApiHandler::handle_scheduler_routes_(AsyncWebServerRequest *request,
+                                                   http_method method,
+                                                   const std::string &url) {
+  // GET /api/v1/time — bridge clock + site timezone.
+  if (method == HTTP_GET && url == "/api/v1/time") {
+    auto *rtc = parent_->get_time();
+    bool synced = rtc != nullptr && rtc->now().is_valid();
+    JsonDocument doc;
+    doc["synced"] = synced;
+    if (synced) {
+      ESPTime t = rtc->now();
+      doc["epoch"] = (uint32_t) t.timestamp;
+      doc["iso_local"] = t.strftime("%Y-%m-%dT%H:%M:%S");
+    } else {
+      doc["epoch"] = nullptr;
+      doc["iso_local"] = nullptr;
+    }
+    doc["timezone"] = parent_->timezone();
+    std::string out;
+    serializeJson(doc, out);
+    send_json_(request, 200, out);
+    return true;
+  }
+
+  // /api/v1/away — GET status, POST {active, return_at?}.
+  if (url == "/api/v1/away") {
+    if (method == HTTP_GET) {
+      send_json_(request, 200, parent_->scheduler().away_json());
+      return true;
+    }
+    if (method == HTTP_POST) {
+      std::string err;
+      if (!parent_->scheduler().set_away_from_json(read_body_(request), err)) {
+        send_error_(request, 400, err.c_str());
+        return true;
+      }
+      send_json_(request, 200, parent_->scheduler().away_json());
+      return true;
+    }
+    return false;
+  }
+
+  // POST /api/v1/timers — convenience one-shot ("off in 30 min").
+  if (url == "/api/v1/timers" && method == HTTP_POST) {
+    uint16_t id;
+    std::string err;
+    if (!parent_->scheduler().create_timer_from_json(read_body_(request), id, err)) {
+      send_error_(request, 400, err.c_str());
+      return true;
+    }
+    JsonDocument doc;
+    doc["id"] = id;
+    std::string out;
+    serializeJson(doc, out);
+    send_json_(request, 200, out);
+    return true;
+  }
+
+  // /api/v1/schedules (collection).
+  const std::string base = "/api/v1/schedules";
+  if (url == base) {
+    if (method == HTTP_GET) {
+      send_json_(request, 200, parent_->scheduler().list_json());
+      return true;
+    }
+    if (method == HTTP_POST) {
+      uint16_t id;
+      std::string err;
+      if (!parent_->scheduler().upsert_from_json(read_body_(request), false, 0, id, err)) {
+        send_error_(request, 400, err.c_str());
+        return true;
+      }
+      std::string out;
+      parent_->scheduler().get_json(id, out);
+      send_json_(request, 200, out);
+      return true;
+    }
+    return false;
+  }
+
+  // /api/v1/schedules/<status|{id}[/enable|/delete]>.
+  if (url.rfind(base + "/", 0) == 0) {
+    std::string rest = url.substr(base.size() + 1);
+    if (rest == "status" && method == HTTP_GET) {
+      send_json_(request, 200, parent_->scheduler().status_json());
+      return true;
+    }
+    std::string idpart = rest, action;
+    auto slash = rest.find('/');
+    if (slash != std::string::npos) {
+      idpart = rest.substr(0, slash);
+      action = rest.substr(slash + 1);
+    }
+    char *endp = nullptr;
+    long idv = strtol(idpart.c_str(), &endp, 10);
+    if (idpart.empty() || endp == idpart.c_str() || *endp != '\0' || idv <= 0 || idv > 65535)
+      return false;
+    uint16_t id = (uint16_t) idv;
+
+    if (action.empty()) {
+      if (method == HTTP_GET) {
+        std::string out;
+        if (!parent_->scheduler().get_json(id, out)) {
+          send_error_(request, 404, "not_found");
+          return true;
+        }
+        send_json_(request, 200, out);
+        return true;
+      }
+      if (method == HTTP_POST) {
+        uint16_t out_id;
+        std::string err;
+        if (!parent_->scheduler().upsert_from_json(read_body_(request), true, id, out_id, err)) {
+          send_error_(request, (err == "not found") ? 404 : 400, err.c_str());
+          return true;
+        }
+        std::string out;
+        parent_->scheduler().get_json(id, out);
+        send_json_(request, 200, out);
+        return true;
+      }
+    } else if (action == "enable" && method == HTTP_POST) {
+      JsonDocument doc;
+      bool enabled = true;
+      if (!deserializeJson(doc, read_body_(request))) enabled = doc["enabled"] | true;
+      if (!parent_->scheduler().set_enabled(id, enabled)) {
+        send_error_(request, 404, "not_found");
+        return true;
+      }
+      send_json_(request, 200, "{\"ok\":true}");
+      return true;
+    } else if (action == "delete" && method == HTTP_POST) {
+      if (!parent_->scheduler().remove(id)) {
+        send_error_(request, 404, "not_found");
+        return true;
+      }
+      send_json_(request, 200, "{\"ok\":true}");
+      return true;
+    }
+    return false;
+  }
+
+  return false;
 }
 
 }  // namespace actron485_api

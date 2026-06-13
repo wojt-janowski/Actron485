@@ -10,8 +10,11 @@
 #include "esphome/core/component.h"
 #include "esphome/core/preferences.h"
 #include "esphome/components/web_server_base/web_server_base.h"
+#include "esphome/components/time/real_time_clock.h"
 #include "esphome/components/actron485/actron485_climate.h"
 #include "Actron485.h"
+
+#include "scheduler.h"
 
 namespace esphome {
 namespace actron485_api {
@@ -25,6 +28,20 @@ class Actron485Api : public Component {
   void set_sensor_stale_timeout_ms(uint32_t ms) { sensor_stale_timeout_ms_ = ms; }
   void set_demo_mode(bool on) { demo_mode_ = on; }
   bool demo_mode() const { return demo_mode_; }
+
+  // ---- Scheduler ----
+  // The bridge clock (sntp `time:` platform) is injected from actron.yaml via
+  // `time_id`. The scheduler reads it for wall-clock time + day-of-week and is
+  // ticked from loop().
+  void set_time(time::RealTimeClock *t) { time_ = t; }
+  time::RealTimeClock *get_time() { return time_; }
+  Scheduler &scheduler() { return scheduler_; }
+
+  // Mutex-encapsulated reads of the weather/forecast cache for the scheduler,
+  // so it never reaches into the FreeRTOS-task-guarded structs directly.
+  // Return false when there's no usable reading (condition then fails safe).
+  bool weather_current_temp(float &out);
+  bool forecast_today(float &temp_min, float &temp_max, int &pop);
 
   // ---- Weather proxy ----
   // Poll interval is the only compile-time tunable (actron.yaml). The API
@@ -135,6 +152,11 @@ class Actron485Api : public Component {
   actron485::Actron485Climate *climate_{nullptr};
   std::string auth_token_;  // empty = no auth
   Actron485ApiHandler *handler_{nullptr};
+
+  // Bridge clock (sntp) + scheduling engine. scheduler_ is constructed with a
+  // back-pointer so it can reach the apply_* command path and state inputs.
+  time::RealTimeClock *time_{nullptr};
+  Scheduler scheduler_{this};
 
   // Stale-sensor safety. last_temp_update_ms_[i] == 0 means we've never
   // received a /temperature POST for that zone, so the watchdog ignores it.
@@ -362,6 +384,12 @@ class Actron485ApiHandler : public AsyncWebHandler {
   void handle_zone_name_(AsyncWebServerRequest *request, int zone, const std::string &body);
   void handle_settings_get_(AsyncWebServerRequest *request);
   void handle_settings_patch_(AsyncWebServerRequest *request, const std::string &body);
+
+  // Scheduler + away + time routes. Returns true if it handled the URL. Kept as
+  // a single self-contained dispatcher (defined at the end of the .cpp) so the
+  // scheduler endpoints sit well away from the forecast handler region.
+  bool handle_scheduler_routes_(AsyncWebServerRequest *request, http_method method,
+                                const std::string &url);
 };
 
 }  // namespace actron485_api
