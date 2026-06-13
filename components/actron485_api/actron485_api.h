@@ -100,6 +100,10 @@ class Actron485Api : public Component {
   void set_api_key_runtime(const std::string &key);
   void set_act_as_slave_3_runtime(bool on);
   void set_logging_mode_runtime(int mode);
+  // Authoritative current logging mode (0=NONE..5=DELTA) for the dashboard
+  // readback, so the Log Mode dropdown reflects exactly what was set/persisted
+  // rather than re-deriving it from the controller's (offset) enum.
+  int logging_mode() { return settings_logging_mode_; }
   // Snapshot of currently-effective settings for GET /api/v1/settings.
   // api_key is returned masked ("***" if set, "" if not).
   std::string build_settings_json();
@@ -251,9 +255,19 @@ class Actron485Api : public Component {
   // Cached for fast PATCH echoes; sourced from NVS at boot (or yaml
   // fallback if NVS is empty).
   bool settings_act_as_slave_3_{false};
-  int  settings_logging_mode_{1};  // 1 = STATUS, ESPHome default
+  int  settings_logging_mode_{1};  // 0=NONE..5=DELTA (1=STATUS, ESPHome default)
   void load_settings_();
   void save_settings_();
+
+  // Applies settings_logging_mode_ to the controller. Mode 0 (NONE) detaches
+  // the log sink entirely (configureLogging(nullptr)) — the only true "off",
+  // since the library gates all output on the sink pointer, not printOutMode.
+  // Other modes restore the saved sink + set the verbosity. Called once from
+  // loop() (after every setup(), so the climate component has attached the
+  // sink — avoids a setup-order race) and again on each runtime change.
+  void apply_logging_mode_();
+  bool logging_applied_{false};
+  Actron485::LogSink *saved_log_sink_{nullptr};
 
   // Site timezone (POSIX TZ string). Stored in its own NVS slot so changing it
   // never disturbs the versioned SettingsBlob (api_key / weather). Defaults to

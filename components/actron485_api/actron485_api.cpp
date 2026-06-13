@@ -8,6 +8,7 @@
 #include "esphome/core/helpers.h"
 #include "esphome/core/preferences.h"
 #include "esphome/components/actron485/utilities.h"
+#include "Utilities.h"  // Actron485::printOut (the global log sink) for true-mute
 #include "esphome/components/actron485/zone_fan.h"
 #include "esphome/components/actron485/zone_climate.h"
 #include "esphome/components/network/util.h"
@@ -911,20 +912,14 @@ void Actron485Api::load_settings_() {
                 blob.weather_location_set ? "set" : "unset");
   settings_act_as_slave_3_ = blob.act_as_slave_3 != 0;
   settings_logging_mode_   = blob.logging_mode;
-  // Push into the live controller. printOutMode is a public enum field.
+  // Push slave-responder into the live controller now. The logging mode is
+  // applied later from loop() (apply_logging_mode_) — it touches the log sink,
+  // which the climate component only attaches at its own setup(), so applying
+  // it here could race the sink (re)attachment.
   if (climate_) {
     auto *c = climate_->get_controller();
     if (c) {
       c->setSlaveResponderMode(3, settings_act_as_slave_3_);
-      // Map int to PrintOutMode enum. Out-of-range falls back to ChangedMessages.
-      switch (settings_logging_mode_) {
-        case 1: c->printOutMode = Actron485::PrintOutMode::StatusOnly; break;
-        case 2: c->printOutMode = Actron485::PrintOutMode::ChangedMessages; break;
-        case 3: c->printOutMode = Actron485::PrintOutMode::AllMessages; break;
-        case 4: c->printOutMode = Actron485::PrintOutMode::CorrelationCapture; break;
-        case 5: c->printOutMode = Actron485::PrintOutMode::RegisterDelta; break;
-        default: c->printOutMode = Actron485::PrintOutMode::ChangedMessages; break;
-      }
     }
   }
   ESP_LOGCONFIG(TAG, "  Loaded settings: act_as_slave_3=%s log_mode=%d api_key=%s",
@@ -1050,20 +1045,42 @@ void Actron485Api::set_act_as_slave_3_runtime(bool on) {
            on ? "ON" : "OFF");
 }
 
+void Actron485Api::apply_logging_mode_() {
+  auto *c = climate_ ? climate_->get_controller() : nullptr;
+  if (c == nullptr) return;
+
+  // Capture the real sink the climate component attached at its setup(), so a
+  // later un-mute can restore it. Lazy + once: by the time loop() first runs
+  // every setup() has completed, so Actron485::printOut is the live sink.
+  if (saved_log_sink_ == nullptr && Actron485::printOut != nullptr) {
+    saved_log_sink_ = Actron485::printOut;
+  }
+
+  if (settings_logging_mode_ <= 0) {
+    // NONE — true off. The library guards every print on the sink pointer
+    // (many lines ignore printOutMode), so detaching the sink is the only way
+    // to fully silence it.
+    c->configureLogging(nullptr);
+    return;
+  }
+
+  // Re-attach the sink (in case we were muted), then set verbosity. Settings
+  // ints are 1=STATUS..5=DELTA; the enum is 0-based, hence the offset mapping.
+  if (saved_log_sink_ != nullptr) c->configureLogging(saved_log_sink_);
+  switch (settings_logging_mode_) {
+    case 1: c->printOutMode = Actron485::PrintOutMode::StatusOnly; break;
+    case 2: c->printOutMode = Actron485::PrintOutMode::ChangedMessages; break;
+    case 3: c->printOutMode = Actron485::PrintOutMode::AllMessages; break;
+    case 4: c->printOutMode = Actron485::PrintOutMode::CorrelationCapture; break;
+    case 5: c->printOutMode = Actron485::PrintOutMode::RegisterDelta; break;
+    default: c->printOutMode = Actron485::PrintOutMode::ChangedMessages; break;
+  }
+}
+
 void Actron485Api::set_logging_mode_runtime(int mode) {
   if (mode < 0 || mode > 5) return;
   settings_logging_mode_ = mode;
-  if (climate_ && climate_->get_controller()) {
-    auto *c = climate_->get_controller();
-    switch (mode) {
-      case 0: /* nothing — disable */                                   break;
-      case 1: c->printOutMode = Actron485::PrintOutMode::StatusOnly;       break;
-      case 2: c->printOutMode = Actron485::PrintOutMode::ChangedMessages;  break;
-      case 3: c->printOutMode = Actron485::PrintOutMode::AllMessages;      break;
-      case 4: c->printOutMode = Actron485::PrintOutMode::CorrelationCapture; break;
-      case 5: c->printOutMode = Actron485::PrintOutMode::RegisterDelta;    break;
-    }
-  }
+  this->apply_logging_mode_();  // runtime — all components are up
   this->save_settings_();
 }
 
@@ -1431,6 +1448,14 @@ void Actron485Api::loop() {
   // Tick the scheduler first — it self-throttles to ~30 s and must run in demo
   // mode too (apply_* honour the simulator). Kept above the early-returns below.
   this->scheduler_.loop();
+
+  // Apply the persisted logging mode once, here rather than in load_settings_,
+  // so the climate component has already attached its log sink (avoids a
+  // setup-order race when restoring/muting the sink).
+  if (!logging_applied_) {
+    logging_applied_ = true;
+    this->apply_logging_mode_();
+  }
 
   if (demo_mode_) {
     this->demo_tick_();
