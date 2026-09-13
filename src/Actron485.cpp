@@ -547,30 +547,10 @@ namespace Actron485 {
             printOut->println();
         }
 
-        // Slave 3 read at start=2 count=11 carries the AC head's authoritative
-        // operating-mode + compressor state. Slave 11's broadcast lags behind
-        // for compressor-active transitions (it stays at 0x80 even when the
-        // compressor is cooling), so prefer slave 3 here when available.
-        //
-        // Reg 2 high byte (bits 0-3 = mode, bit 6 = compressor cooling,
-        //                  bit 7 = quiet mode):
-        //   0x02 = Cool/Auto, compressor idle
-        //   0x42 (bits 1+6) = Cool, compressor cooling   (also seen 0x47/0x4A —
-        //                     the low nibble seems to be a small counter)
-        //   0x01 = Heat, compressor idle
-        //   0x01 + low byte 0x64 = Heat, compressor heating
-        //   0x08 = Fan only
-        //   +0x80 overlaid on any of the above = quiet mode flag (Phase 2
-        //                                        probe 2026-04-30: 0x01 → 0x81)
-        //
-        // Reg 2 low byte:
-        //   0x00 = Cool        (when reg 2 hi == 0x02)
-        //   0x23 = Auto        (when reg 2 hi == 0x02)
-        //   ... low-nibble counters when actively cooling (0x42-0x4A range)
-        //
-        // Reg 3 high byte: bit 0 = system armed (any zone enabled),
-        //                  bit 1 = fan running (transient at spin-up),
-        //                  bit 2 = continuous-fan flag.
+        // Original-controller captures (2026-09-13): reg 2 high byte selects
+        // Heat/Cool/Fan; its low byte is a varying thermal demand/activity
+        // value, not an Auto selector. Auto on the LCD chooses Heat or Cool
+        // in software. This is commanded activity, not compressor feedback.
         if (startAddress > 2 || startAddress + regCount <= 2) {
             return;
         }
@@ -581,16 +561,11 @@ namespace Actron485 {
         stateMessage2.quietMode = (reg2HiRaw & 0x80) != 0;
         uint8_t reg2Hi = reg2HiRaw & 0x7F;
 
-        if ((reg2Hi & 0x40) != 0) {
-            // Compressor actively cooling.
+        if (reg2Hi == 0x02) {
             stateMessage2.operatingMode = OperatingMode::Cool;
-            stateMessage2.compressorMode = CompressorMode::Cooling;
-        } else if (reg2Hi == 0x02) {
-            // Cool or Auto, compressor idle. Distinguish by low byte.
-            stateMessage2.operatingMode = (reg2Lo == 0x23)
-                ? OperatingMode::Auto
-                : OperatingMode::Cool;
-            stateMessage2.compressorMode = CompressorMode::Idle;
+            stateMessage2.compressorMode = (reg2Lo != 0x00)
+                ? CompressorMode::Cooling
+                : CompressorMode::Idle;
         } else if (reg2Hi == 0x01) {
             // Heat. Low byte non-zero = compressor actually heating
             // (0x64 observed). 0x00 = standby.
@@ -607,24 +582,11 @@ namespace Actron485 {
         }
         // Unknown patterns: leave previous values untouched.
 
-        // Reg 3 carries fan setting + status flags (Phase 2 probe 2026-04-30):
-        //
-        //   High byte:
-        //     bit 0 = system armed
-        //     bit 1 = fan running (transient at spin-up; also set in non-fan-
-        //             only modes when fan is auto-running)
-        //     bit 2 = continuous fan flag
-        //     (in Fan-only mode, bits 3-7 ALSO reflect the user-selected fan
-        //      speed: bit 3 = Low, bit 4 = Medium, bit 6 = High; we read the
-        //      low byte instead since it's mode-independent)
-        //
-        //   Low byte = explicit fan speed value:
-        //     0x00 = Auto / Esp (let the system pick)
-        //     0x28 (40) = Low
-        //     0x3D (61) = Medium
-        //     0x59 (89) = High
-        //   Holds across Heat/Cool/Fan-only — in thermal modes, 0x00 (Auto)
-        //   is the typical default.
+        // Reg 3: armed=0x01, continuous=0x04; observed fan commands are
+        // Auto=0x02, Low=0x08, Medium=0x10, High=0x20 in the high byte.
+        // In thermal modes these describe the controller's chosen output:
+        // LCD Auto can produce High. We cannot recover that user preference
+        // or prove physical airflow from this register alone.
         if (startAddress + regCount > 3) {
             uint16_t reg3Index = 3 - startAddress;
             uint8_t reg3Hi = data[reg3Index * 2];
@@ -644,14 +606,9 @@ namespace Actron485 {
                     break;
             }
             stateMessage2.fanMode = decodedFan;
-            // Running fan is what's actually moving air right now. In
-            // Fan-only mode the requested speed IS what's running; in
-            // thermal modes it's only running when the compressor calls for
-            // it (bit 1 of reg 3 high byte indicates that).
-            stateMessage2.runningFanMode = ((reg3Hi & 0x02) != 0)
-                ? decodedFan
-                : FanMode::Off;
-            stateMessage2.fanActive = (reg3Hi & 0x02) != 0;
+            const bool fanCommandActive = (reg3Hi & 0x3A) != 0;
+            stateMessage2.runningFanMode = fanCommandActive ? decodedFan : FanMode::Off;
+            stateMessage2.fanActive = fanCommandActive;
         }
     }
 
@@ -774,8 +731,7 @@ namespace Actron485 {
                     stateMessage2.operatingMode = OperatingMode::Heat;
                     break;
                 case 0x02:
-                    // Default to Cool — Auto vs Cool disambiguation comes
-                    // from slave 3 read response (separate Phase 2 task).
+                    // Reports the active branch, including LCD Auto cooling.
                     stateMessage2.operatingMode = OperatingMode::Cool;
                     break;
                 case 0x08:
@@ -1480,11 +1436,10 @@ namespace Actron485 {
             return;
         }
 
-        // Mirror the read-side decode in applySlave3ReadResponse(): mode lives
-        // in reg 2 high byte. We only express user-facing state here (the
-        // compressor sub-state in the low byte is set by the AMIB/AC head
-        // downstream — we report "idle" values so we don't lie about the
-        // hardware). Quiet bit (0x80) is OR'd in when stateMessage2 says so.
+        // Thermal demand is generated by the original wall controller, not
+        // filled in by the AMIB. Keep it at standby until its control law is
+        // understood; a fixed demand would bypass temperature regulation.
+        // Fan-only command encoding is backed by original-controller captures.
         uint8_t reg2Hi = 0x00;
         uint8_t reg2Lo = 0x00;
         OperatingMode mode = stateMessage2.initialised ? stateMessage2.operatingMode : OperatingMode::Off;
@@ -1497,8 +1452,11 @@ namespace Actron485 {
                 reg2Lo = 0x00;
                 break;
             case OperatingMode::Auto:
+                // No distinct Auto wire mode has been observed. The comfort-
+                // band controller is not implemented yet; do not emit 0x23
+                // as a mode selector (it would request cooling demand).
                 reg2Hi = 0x02;
-                reg2Lo = 0x23;
+                reg2Lo = 0x00;
                 break;
             case OperatingMode::FanOnly:
                 reg2Hi = 0x08;
@@ -1514,17 +1472,8 @@ namespace Actron485 {
         }
         _slaveRegisters[2] = (uint16_t(reg2Hi) << 8) | reg2Lo;
 
-        // Reg 3: high byte = status flags, low byte = fan speed.
-        //
-        // Decoded from LCD probes on 2026-05-30 (PROTOCOL_NOTES.md "Reg 3 hi
-        // status flags"):
-        //   bit 0 = system armed (set whenever any zone is enabled)
-        //   bit 1 = fan running (set transiently when fan is spinning)
-        //   bit 2 = continuous fan flag
-        //   bit 3 = unknown — set in Heat-armed states regardless of fan
-        //           speed or continuous-fan setting; safe to leave 0 from us.
-        // The earlier hypothesis that the high byte is a zone bitmap was
-        // wrong: zones live in reg 4 hi (see below).
+        // Captured fan-only commands: Low=0928, Medium=113D,
+        // High=2159, Auto=0300 (armed, non-continuous).
         uint8_t reg3Hi = 0x00;
         bool anyZoneOn = false;
         for (int z = 0; z < 8; z++) {
@@ -1535,29 +1484,37 @@ namespace Actron485 {
         uint8_t reg3Lo;
         switch (stateMessage2.fanMode) {
             case FanMode::Low:
-            case FanMode::LowContinuous:       reg3Lo = 0x28; break;
+            case FanMode::LowContinuous:
+                reg3Lo = 0x28;
+                if (anyZoneOn && mode != OperatingMode::Off) reg3Hi |= 0x08;
+                break;
             case FanMode::Medium:
-            case FanMode::MediumContinuous:    reg3Lo = 0x3D; break;
+            case FanMode::MediumContinuous:
+                reg3Lo = 0x3D;
+                if (anyZoneOn && mode != OperatingMode::Off) reg3Hi |= 0x10;
+                break;
             case FanMode::High:
-            case FanMode::HighContinuous:      reg3Lo = 0x59; break;
+            case FanMode::HighContinuous:
+                reg3Lo = 0x59;
+                if (anyZoneOn && mode != OperatingMode::Off) reg3Hi |= 0x20;
+                break;
             case FanMode::Esp:
             case FanMode::EspContinuous:
-            default:                           reg3Lo = 0x00; break;
+            default:
+                reg3Lo = 0x00;
+                if (anyZoneOn && mode == OperatingMode::FanOnly) reg3Hi |= 0x02;
+                break;
         }
         _slaveRegisters[3] = (uint16_t(reg3Hi) << 8) | reg3Lo;
 
-        // Reg 4: high byte = zone-enable bitmap (zone N → bit N-1); low byte
-        // = constant 0x23. The zone bitmap doubles as the system-on signal —
-        // when zoneBitmap == 0x00 the AMIB treats the AC as off, no matter
-        // what reg 2 hi says. The earlier "bit 1 = system on" reading was a
-        // misinterpretation: bit 1 just happened to be zone 2, which the
-        // AMIB defaulted to whenever we asked for "system on" without
-        // specifying a zone. Decoded from LCD probes on 2026-05-30.
+        // Zone N is bit N-1 in the high byte. The captured low byte is
+        // 0x00 for Fan-only, 0x23 for Heat/Cool and Off.
         uint8_t zoneBitmap = 0x00;
         for (int z = 0; z < 8; z++) {
             if (stateMessage2.zoneOn[z]) zoneBitmap |= uint8_t(1 << z);
         }
-        _slaveRegisters[4] = (uint16_t(zoneBitmap) << 8) | 0x23;
+        _slaveRegisters[4] = (uint16_t(zoneBitmap) << 8) |
+            (mode == OperatingMode::FanOnly ? 0x00 : 0x23);
 
         // Regs 5-12: one per zone. Setpoint comes from zoneSetpoint[]
         // (driven by setZoneSetpointTemperatureCustom + setMasterSetpoint),
