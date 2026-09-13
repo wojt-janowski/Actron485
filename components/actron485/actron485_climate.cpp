@@ -60,6 +60,11 @@ void Actron485ZoneFan::setup() {
 }
 
 void Actron485Climate::setup() {
+    auto_range_pref_=global_preferences->make_preference<AutoRange>(fnv1_hash(std::string("actron485_auto_range_v1")));
+    AutoRange restored{};
+    if (auto_range_pref_.load(&restored) && actron_controller.setAutoComfortRange(restored.low,restored.high)) {
+        saved_auto_range_=restored;
+    }
     uint8_t we_pin = 0;
     if (we_pin_ != NULL) {
         we_pin = we_pin_->get_pin();
@@ -118,6 +123,13 @@ void Actron485Climate::loop() {
     if (now-counter > 1000) {
         counter = now;
         update_status();
+        if (now-auto_range_last_save_ >= 5000) {
+            auto_range_last_save_=now;
+            AutoRange current{actron_controller.getAutoTargetLow(),actron_controller.getAutoTargetHigh()};
+            if (current.low != saved_auto_range_.low || current.high != saved_auto_range_.high) {
+                if (auto_range_pref_.save(&current)) saved_auto_range_=current;
+            }
+        }
         if (act_as_slave_3_) {
             maybe_save_slave3_state_();
         }

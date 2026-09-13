@@ -1240,7 +1240,7 @@ void Actron485Api::dump_config() {
 // task start returning 503s and eventually triggered the task watchdog.
 void Actron485Api::apply_system_on(bool on) {
   if (demo_mode_) { demo_system_on_ = on; return; }
-  controller()->setSystemOn(on);
+  this->defer([this, on] { controller()->setSystemOn(on); });
 }
 void Actron485Api::apply_operating_mode(Actron485::OperatingMode mode) {
   if (demo_mode_) {
@@ -1251,30 +1251,30 @@ void Actron485Api::apply_operating_mode(Actron485::OperatingMode mode) {
                         mode != Actron485::OperatingMode::OffHeat);
     return;
   }
-  controller()->setOperatingMode(mode);
+  this->defer([this, mode] { controller()->setOperatingMode(mode); });
 }
 void Actron485Api::apply_fan_speed(Actron485::FanMode mode) {
   if (demo_mode_) { demo_fan_ = mode; return; }
-  controller()->setFanSpeed(mode);
+  this->defer([this, mode] { controller()->setFanSpeed(mode); });
 }
 void Actron485Api::apply_continuous_fan(bool on) {
   if (demo_mode_) { demo_continuous_fan_ = on; return; }
-  controller()->setContinuousFanMode(on);
+  this->defer([this, on] { controller()->setContinuousFanMode(on); });
 }
 void Actron485Api::apply_quiet_mode(bool on) {
   // Demo mode doesn't simulate quiet (the demo simulator only cares about
   // mode/setpoint/fan); silently no-op so the API call still succeeds.
   if (demo_mode_) { return; }
-  controller()->setQuietMode(on);
+  this->defer([this, on] { controller()->setQuietMode(on); });
 }
 void Actron485Api::apply_master_setpoint(double temperature) {
   if (demo_mode_) { demo_setpoint_ = (float) temperature; return; }
-  controller()->setMasterSetpoint(temperature);
+  this->defer([this, temperature] { controller()->setMasterSetpoint(temperature); });
 }
 void Actron485Api::apply_zone_on(uint8_t zone, bool on) {
   if (zone < 1 || zone > 8) return;
   if (demo_mode_) { demo_zone_on_[zone - 1] = on; return; }
-  controller()->setZoneOn(zone, on);
+  this->defer([this, zone, on] { controller()->setZoneOn(zone, on); });
 }
 void Actron485Api::apply_zone_setpoint(uint8_t zone, double temperature) {
   if (zone < 1 || zone > 8) return;
@@ -1291,17 +1291,22 @@ void Actron485Api::apply_zone_setpoint(uint8_t zone, double temperature) {
     demo_zone_setpoint_[zone - 1] = clamped;
     return;
   }
-  controller()->setZoneSetpointTemperatureCustom(zone, temperature, false);
+  this->defer([this, zone, temperature] { controller()->setZoneSetpointTemperatureCustom(zone, temperature, false); });
 }
 void Actron485Api::apply_zone_control(uint8_t zone, bool enabled) {
   if (zone < 1 || zone > 8) return;
   if (demo_mode_) { demo_zone_control_[zone - 1] = enabled; return; }
-  controller()->setControlZone(zone, enabled);
+  this->defer([this, zone, enabled] { controller()->setControlZone(zone, enabled); });
 }
 void Actron485Api::apply_zone_current_temperature(uint8_t zone, double temperature) {
   if (zone < 1 || zone > 8) return;
   if (demo_mode_) { demo_zone_current_[zone - 1] = (float) temperature; return; }
-  controller()->setZoneCurrentTemperature(zone, temperature);
+  this->defer([this, zone, temperature] { controller()->setZoneCurrentTemperature(zone, temperature); });
+}
+
+void Actron485Api::apply_auto_range(double low, double high) {
+  if (demo_mode_) { demo_setpoint_=(low+high)/2; return; }
+  this->defer([this, low, high] { controller()->setAutoComfortRange(low, high); });
 }
 
 bool Actron485Api::state_receiving_data() {
@@ -1481,9 +1486,8 @@ void Actron485Api::loop() {
     uint8_t zone = (uint8_t) (i + 1);
     if (controller()->getControlZone(zone)) {
       if (responderMode) {
-        ESP_LOGW(TAG, "Zone %u sensor stale (no POST for %lu ms); keeping "
-                       "last-known-good temp because slave-3 responder is "
-                       "active (cannot release role).",
+        ESP_LOGW(TAG, "Zone %u sensor stale (no POST for %lu ms); thermal control "
+                       "requires fresh sensor input.",
                  zone, now - last_temp_update_ms_[i]);
       } else {
         ESP_LOGW(TAG, "Zone %u sensor stale (no POST for %lu ms); releasing "
@@ -1549,8 +1553,18 @@ std::string Actron485Api::build_state_json() {
     root["fan_running"] = fan_mode_to_string(c->getRunningFanSpeed());
     root["continuous_fan"] = c->getContinuousFanMode();
     root["quiet_mode"] = c->getQuietMode();
-    root["compressor"] = compressor_to_string(c->getCompressorMode());
+    // Demand is not independent evidence of compressor operation.
+    root["compressor"] = c->getSlaveResponderEnabled() ? "unknown" : compressor_to_string(c->getCompressorMode());
+    root["activity_source"] = c->getSlaveResponderEnabled() ? "requested" : "bus";
     root["setpoint"] = c->getMasterSetpoint();
+    root["temperature_low"] = c->getAutoTargetLow();
+    root["temperature_high"] = c->getAutoTargetHigh();
+    if (c->getSlaveResponderEnabled()) {
+      const auto &thermal=c->getThermalOutput();
+      root["thermal_branch"] = operating_mode_to_string(thermal.branch);
+      root["thermal_demand"] = thermal.demand;
+      root["thermal_status"] = thermal.reason;
+    }
     root["current_temperature"] = c->getMasterCurrentTemperature();
     double outdoor = c->getOutdoorTemperature();
     if (std::isfinite(outdoor)) {
@@ -1569,6 +1583,7 @@ std::string Actron485Api::build_state_json() {
       if (climate_->has_ultima()) {
         z["setpoint"] = c->getZoneSetpointTemperature(i);
         z["current_temperature"] = c->getZoneCurrentTemperature(i);
+        z["sensor_fresh"] = c->isZoneSensorFresh(i);
       }
       // Humidity is independent of Ultima — it's just an external
       // sensor relay through /api/v1/zones/{n}/humidity. Surface NaN
@@ -2002,11 +2017,24 @@ void Actron485ApiHandler::handle_quiet_(AsyncWebServerRequest *request, const st
 void Actron485ApiHandler::handle_setpoint_(AsyncWebServerRequest *request, const std::string &body) {
   JsonDocument doc;
   if (deserializeJson(doc, body)) { send_error_(request, 400, "invalid_json"); return; }
+  if (!doc["temperature_low"].isNull() || !doc["temperature_high"].isNull()) {
+    if (!doc["temperature_low"].is<double>() || !doc["temperature_high"].is<double>() ||
+        !doc["temperature"].isNull()) {
+      send_error_(request, 400, "provide_low_and_high_only"); return;
+    }
+    double low=doc["temperature_low"].as<double>();
+    double high=doc["temperature_high"].as<double>();
+    if (!std::isfinite(low) || !std::isfinite(high) || low < 16 || high > 30 || high-low < 1) {
+      send_error_(request, 400, "invalid_comfort_range"); return;
+    }
+    parent_->apply_auto_range(low,high);
+    send_json_(request, 202, "{\"status\":\"queued\"}"); return;
+  }
   if (!doc["temperature"].is<float>() && !doc["temperature"].is<double>() && !doc["temperature"].is<int>()) {
     send_error_(request, 400, "missing_temperature"); return;
   }
   double t = doc["temperature"].as<double>();
-  if (t < 16.0 || t > 30.0) { send_error_(request, 400, "temperature_out_of_range"); return; }
+  if (!std::isfinite(t) || t < 16.0 || t > 30.0) { send_error_(request, 400, "temperature_out_of_range"); return; }
   parent_->apply_master_setpoint(t);
   send_json_(request, 202, "{\"status\":\"queued\"}");
 }
@@ -2024,7 +2052,7 @@ void Actron485ApiHandler::handle_zone_(AsyncWebServerRequest *request, int zone,
       send_error_(request, 400, "setpoint_requires_ultima"); return;
     }
     double t = doc["setpoint"].as<double>();
-    if (t < 16.0 || t > 30.0) { send_error_(request, 400, "setpoint_out_of_range"); return; }
+    if (!std::isfinite(t) || t < 16.0 || t > 30.0) { send_error_(request, 400, "setpoint_out_of_range"); return; }
     parent_->apply_zone_setpoint((uint8_t) zone, t);
   }
   send_json_(request, 202, "{\"status\":\"queued\"}");
@@ -2058,7 +2086,7 @@ void Actron485ApiHandler::handle_zone_temperature_(AsyncWebServerRequest *reques
   double t = doc["current"].as<double>();
   // Wide bounds — not the AC's setpoint range; just sanity-checking the
   // reading is plausibly room temperature in Celsius.
-  if (t < 0.0 || t > 60.0) { send_error_(request, 400, "temperature_out_of_range"); return; }
+  if (!std::isfinite(t) || t < 0.0 || t > 60.0) { send_error_(request, 400, "temperature_out_of_range"); return; }
   bool controlled = parent_->demo_mode()
                        ? false  // demo: just accept the reading
                        : parent_->controller()->getControlZone((uint8_t) zone);

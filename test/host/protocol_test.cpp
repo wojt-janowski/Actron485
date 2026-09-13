@@ -50,6 +50,14 @@ int main() {
     c.setSystemOn(false);
     check(c.getSlaveRegister(2) == 0, "off mode cleared");
     check(c.getSlaveRegister(4) == 0x0023, "off clears all zones");
+    c.setAutoComfortRange(20,22);
+    c.setOperatingMode(OperatingMode::Auto);
+    std::vector<uint8_t> echo={11,16,0,2,0,10,20};
+    echo.resize(27,0); echo[7]=2; echo[9]=0x40; echo[10]=0x23;
+    feed(c,bus,echo);
+    check(c.getOperatingMode()==OperatingMode::Auto, "downstream thermal branch cannot overwrite selected Auto");
+    check(c.getAutoTargetLow()==20 && c.getAutoTargetHigh()==22, "echo preserves comfort range");
+    c.setSystemOn(false);
     c.setSlaveResponderMode(3, false);
     bus.outgoing.clear();
     struct Capture { uint16_t mode, fan; OperatingMode decoded; CompressorMode activity; };

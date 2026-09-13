@@ -144,6 +144,7 @@ class Actron485Api : public Component {
   void apply_continuous_fan(bool on);
   void apply_quiet_mode(bool on);
   void apply_master_setpoint(double temperature);
+  void apply_auto_range(double low, double high);
   void apply_zone_on(uint8_t zone, bool on);
   void apply_zone_setpoint(uint8_t zone, double temperature);
   void apply_zone_control(uint8_t zone, bool enabled);

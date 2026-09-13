@@ -36,3 +36,12 @@ is removed; it would otherwise be interpreted as a fixed cooling demand.
 Do not treat this patch as working replacement thermal control. Do not infer
 an exact demand control law from these few snapshots or replay fixed maximum
 demand as a thermostat implementation.
+
+## Subsequent experimental controller implementation
+
+Bridge 0.1.2 adds a separate replacement thermostat policy; the above captures
+remain the evidence record, not a claim that policy has been reverse engineered.
+See `superpowers/specs/2026-09-13-que-thermal-control-design.md` and
+`include/QueThermostat.h`. It requires fresh enabled-zone sensors, separates
+selected mode from emitted Heat/Cool branch, enforces restart/changeover delay,
+and ramps bounded demand. Physical response and tuning still require testing.

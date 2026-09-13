@@ -130,6 +130,11 @@ class Actron485Climate : public climate::Climate, public Component {
         Actron485ZoneFan *zones_[8] = {};
         Actron485ZoneClimate *zone_climates_[8] = {};
 
+        struct AutoRange { double low; double high; };
+        AutoRange saved_auto_range_{21,23};
+        ESPPreferenceObject auto_range_pref_;
+        unsigned long auto_range_last_save_=0;
+
         // For debouncing
         unsigned long command_last_sent_ = 0;
 

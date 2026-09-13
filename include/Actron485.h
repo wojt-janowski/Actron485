@@ -4,6 +4,7 @@
 #include "Actron485Platform.h"
 #include "Actron485Stream.h"
 #include "Actron485Models.h"
+#include "QueThermostat.h"
 
 /// moves zones 1-8 to array indexed 0-7
 #define zindex(z) z-1
@@ -12,6 +13,15 @@ namespace Actron485 {
 
 class Controller {
 
+    QueThermostat _thermostat;
+    uint32_t _thermalLastTick = 0;
+    uint32_t _sensorUpdated[8] = {};
+    bool _sensorSeen[8] = {};
+    double _sensorTemperature[8] = {};
+    static constexpr uint32_t SENSOR_FRESH_MS = 120000;
+    double _autoLow = 21.0, _autoHigh = 23.0;
+    void tickThermostat();
+    double effectiveZoneTarget(int z) const;
     SerialStream *_serial;
 
     uint8_t _writeEnablePin;
@@ -390,6 +400,12 @@ public:
     /// not retain the reference across `loop()` invocations — entries are
     /// updated in place when their value changes.
     const RegisterCacheEntry &getRegisterCacheEntry(size_t i) { return _registerCache[i]; }
+
+    bool setAutoComfortRange(double low, double high);
+    double getAutoTargetLow() const { return _autoLow; }
+    double getAutoTargetHigh() const { return _autoHigh; }
+    const QueThermostat::Output &getThermalOutput() const { return _thermostat.output(); }
+    bool isZoneSensorFresh(uint8_t zone) const;
 
     // System Control
     // Generally if receivingData() is returning false sending commands are dropped as most commands
