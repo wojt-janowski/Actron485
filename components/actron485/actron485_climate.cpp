@@ -76,6 +76,7 @@ void Actron485Climate::setup() {
     // wall-controller zone is targeting).
     if (control_zone_number_ >= 1 && control_zone_number_ <= 8) {
         actron_controller.setControlZone((uint8_t) control_zone_number_, true);
+        actron_controller.setMasterZone((uint8_t) control_zone_number_);
     }
     // Enable slave-3 responder if the YAML flag is set. Must happen AFTER
     // setControlZone so the initial renderSlave3State() inside

@@ -800,12 +800,8 @@ namespace Actron485 {
         // setpoint and fall back to the first non-zero setpoint for
         // backward compatibility on rigs that don't configure it.
         double masterSetpoint = -1.0;
-        for (int z = 0; z < 8; z++) {
-            if (zoneControlled[z] && zoneSetpoint[z] > 0.0) {
-                masterSetpoint = zoneSetpoint[z];
-                break;
-            }
-        }
+        const int masterIdx = masterZoneIndex();
+        if (masterIdx >= 0 && zoneSetpoint[masterIdx] > 0.0) masterSetpoint = zoneSetpoint[masterIdx];
         stateMessage2.setpoint = (masterSetpoint > 0.0) ? masterSetpoint : firstValidSetpoint;
 
         // Master indoor temp stop-gap remains the mean of all 8 zone temps
@@ -1293,6 +1289,18 @@ namespace Actron485 {
         return zoneControlled[zindex(zone)];
     }
 
+    void Controller::setMasterZone(uint8_t zone) {
+        _masterZone = zone <= 8 ? zone : 0;
+    }
+
+    int Controller::masterZoneIndex() const {
+        if (_masterZone >= 1 && _masterZone <= 8) return _masterZone - 1;
+        for (int z = 0; z < 8; z++) {
+            if (zoneControlled[z]) return z;
+        }
+        return -1;
+    }
+
     // Modbus slave-responder mode (Phase 3, 2026-05-01).
     //
     // When enabled, inbound Modbus requests addressed to `_slaveResponderId`
@@ -1624,10 +1632,7 @@ namespace Actron485 {
                     if (stateMessage2.zoneOn[z]) { anyZone = true; break; }
                 }
                 if (!anyZone) {
-                    int fallback = -1;
-                    for (int z = 0; z < 8; z++) {
-                        if (zoneControlled[z]) { fallback = z; break; }
-                    }
+                    int fallback = masterZoneIndex();
                     if (fallback < 0) fallback = 0;  // zone 1
                     stateMessage2.zoneOn[fallback] = true;
                 }
@@ -1856,14 +1861,20 @@ namespace Actron485 {
         nextSetpointCommand.temperature = temperature;
         sendSetpointCommand = true;
 
-        // Slave-3 responder: master setpoint = control-zone's setpoint
-        // (PROTOCOL_NOTES.md line ~222). Any zone marked controlled by this
-        // module receives the new setpoint; in the typical single-zone rig
-        // only one is set, but multi-zone configs cascade as expected.
+        // Slave-3 responder: master setpoint = the master zone's setpoint
+        // (PROTOCOL_NOTES.md line ~222). Other zones keep their own setpoint
+        // while it stays within the master ± ZONE_WINDOW, and move to the
+        // nearest edge otherwise. Auto zone targets are independent centres,
+        // so they are left alone.
         if (_slaveResponderEnabled && _slaveResponderId == 3) {
+            const int masterIdx = masterZoneIndex();
+            const bool autoMode = stateMessage2.operatingMode == OperatingMode::Auto;
             for (int z = 0; z < 8; z++) {
-                if (zoneControlled[z] || stateMessage2.zoneOn[z]) {
+                if (z == masterIdx) {
                     zoneSetpoint[z] = temperature;
+                } else if (!autoMode && (zoneControlled[z] || stateMessage2.zoneOn[z])) {
+                    if (!std::isfinite(zoneSetpoint[z]) || zoneSetpoint[z] <= 0) zoneSetpoint[z] = temperature;
+                    else zoneSetpoint[z] = std::clamp(zoneSetpoint[z], temperature - ZONE_WINDOW, temperature + ZONE_WINDOW);
                 }
             }
             stateMessage2.initialised = true;
@@ -1974,6 +1985,20 @@ namespace Actron485 {
             return;
         }
 
+        // Slave-3 responder in Heat/Cool: the master zone's setpoint is the
+        // master setpoint, and every other zone must stay within its window.
+        // A zone change never moves the master unless adjustMaster asks to.
+        if (_slaveResponderEnabled && _slaveResponderId == 3 && stateMessage2.operatingMode != OperatingMode::Auto) {
+            if (zindex(zone) == masterZoneIndex()) {
+                setMasterSetpoint(temperature);
+                return;
+            }
+            const double master = stateMessage2.setpoint;
+            if (!adjustMaster && std::isfinite(master) && master >= 16) {
+                temperature = std::clamp(temperature, master - ZONE_WINDOW, master + ZONE_WINDOW);
+            }
+        }
+
         if (zoneControlled[zindex(zone)] == true) {
             // Check if we need to adjust the master first
             if (adjustMaster) {
@@ -2011,16 +2036,9 @@ namespace Actron485 {
         }
 
         if (_slaveResponderEnabled && _slaveResponderId == 3) {
-            // Keep stateMessage2.setpoint in sync with the control zone's
-            // setpoint so the ESPHome climate entity and /api/v1/state.setpoint
-            // don't lag the wire value. Master setpoint IS the control
-            // zone's setpoint by design — see PROTOCOL_NOTES.md.
-            // Auto per-zone targets are independent centers; preserve the
-            // master comfort-band midpoint when adjusting one zone.
-            if (zoneControlled[zindex(zone)] && stateMessage2.operatingMode != OperatingMode::Auto) {
-                stateMessage2.initialised = true;
-                stateMessage2.setpoint = temperature;
-            }
+            // The master zone in Heat/Cool went through setMasterSetpoint
+            // above. Auto per-zone targets are independent centres, so the
+            // master comfort-band midpoint is left alone here.
             tickThermostat();
             renderSlave3State();
         }

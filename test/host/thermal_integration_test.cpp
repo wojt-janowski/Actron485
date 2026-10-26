@@ -79,8 +79,12 @@ int main() {
  c.setZoneSetpointTemperatureCustom(7,22,false);
  c.setZoneSetpointTemperatureCustom(7,NAN,false);
  assert(c.getZoneSetpointTemperature(7)==22);
+ // Heat/Cool zone setpoints stay within master ± 2 °C.
+ assert(c.getMasterSetpoint()==21);
+ c.setZoneSetpointTemperature(7,23,false);
+ assert(c.getZoneSetpointTemperature(7)==23);
  c.setZoneSetpointTemperature(7,24,false);
- assert(c.getZoneSetpointTemperature(7)==24);
+ assert(c.getZoneSetpointTemperature(7)==23);
  c.setControlZone(7,true);
  c.setAutoComfortRange(20,22);
  c.setOperatingMode(OperatingMode::Auto);
@@ -91,5 +95,32 @@ int main() {
  c.setMasterSetpoint(30);
  assert(c.getMasterSetpoint()==29);
  assert(c.getAutoTargetLow()==28 && c.getAutoTargetHigh()==30);
+ // Sensor readings claim every zone; only the master zone carries the
+ // master setpoint. Other zones keep their setpoint while it fits the
+ // window and move to the nearest edge when it doesn't.
+ static NullBus bus2;
+ static Controller d(bus2, 0);
+ d.setSlaveResponderMode(3,true);
+ for(int z=1;z<=8;++z) d.setControlZone(z,true);
+ d.setMasterZone(8);
+ d.setOperatingMode(OperatingMode::Cool);
+ for(auto &on:d.stateMessage2.zoneOn) on=true;
+ d.setMasterSetpoint(22);
+ assert(d.getMasterSetpoint()==22 && d.getZoneSetpointTemperature(1)==22 && d.getZoneSetpointTemperature(8)==22);
+ d.setZoneSetpointTemperatureCustom(1,23.5,false);
+ d.setZoneSetpointTemperatureCustom(2,25,false);
+ assert(d.getZoneSetpointTemperature(1)==23.5);
+ assert(d.getZoneSetpointTemperature(2)==24);   // clamped to master + 2
+ assert(d.getMasterSetpoint()==22);              // a room never moves the master
+ d.setMasterSetpoint(20);
+ assert(d.getMasterSetpoint()==20 && d.getZoneSetpointTemperature(8)==20);
+ assert(d.getZoneSetpointTemperature(1)==22);    // 23.5 -> nearest edge
+ assert(d.getZoneSetpointTemperature(2)==22);
+ assert(d.getZoneSetpointTemperature(3)==22);    // already inside, unchanged
+ d.setZoneSetpointTemperatureCustom(3,19,false);
+ d.setZoneSetpointTemperatureCustom(8,21,false); // master zone = master setpoint
+ assert(d.getMasterSetpoint()==21 && d.getZoneSetpointTemperature(8)==21);
+ assert(d.getZoneSetpointTemperature(1)==22 && d.getZoneSetpointTemperature(3)==19);
+ assert((d.getSlaveRegister(5)>>8)==44);         // zone 1 register carries 22 °C
  std::puts("Thermal controller integration tests passed");
 }

@@ -20,6 +20,11 @@ class Controller {
     double _sensorTemperature[8] = {};
     static constexpr uint32_t SENSOR_FRESH_MS = 120000;
     double _autoLow = 21.0, _autoHigh = 23.0;
+    /// Wall-controller zone (1-8) whose setpoint is the master setpoint; 0 = unset.
+    uint8_t _masterZone = 0;
+    /// Que zones may be set within this many °C of the master in Heat/Cool.
+    static constexpr double ZONE_WINDOW = 2.0;
+    int masterZoneIndex() const;
     void tickThermostat();
     double effectiveZoneTarget(int z) const;
     SerialStream *_serial;
@@ -369,6 +374,13 @@ public:
     /// @param zone
     /// @return true if this module is controlling the specified zone
     bool getControlZone(uint8_t zone);
+
+    /// @brief Set the wall-controller zone, whose setpoint is the master setpoint.
+    /// Separate from setControlZone: a controller may supply sensor readings for
+    /// many zones while only one of them carries the master setpoint. When unset,
+    /// the first controlled zone is used.
+    /// @param zone 1-8, or 0 to unset
+    void setMasterZone(uint8_t zone);
 
     /// @brief Enable or disable Modbus slave-responder mode.
     /// When enabled, inbound Function 0x03/0x06/0x10 requests addressed to
