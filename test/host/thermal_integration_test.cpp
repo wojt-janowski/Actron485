@@ -122,5 +122,14 @@ int main() {
  assert(d.getMasterSetpoint()==21 && d.getZoneSetpointTemperature(8)==21);
  assert(d.getZoneSetpointTemperature(1)==22 && d.getZoneSetpointTemperature(3)==19);
  assert((d.getSlaveRegister(5)>>8)==44);         // zone 1 register carries 22 °C
+ // After a reboot the master setpoint is re-derived from the restored
+ // master-zone setpoint.
+ static NullBus bus3;
+ static Controller e(bus3, 0);
+ e.setControlZone(8,true);
+ e.setMasterZone(8);
+ e.zoneSetpoint[7]=23;
+ e.setSlaveResponderMode(3,true);
+ assert(e.getMasterSetpoint()==23);
  std::puts("Thermal controller integration tests passed");
 }

@@ -1422,6 +1422,15 @@ namespace Actron485 {
             stateMessage2.runningFanMode = FanMode::Off;
             stateMessage2.initialised = true;
         }
+
+        // The master setpoint is the master zone's setpoint. Zone setpoints
+        // come back from NVS, but nothing else re-derives the master in
+        // responder mode (our own broadcasts are ignored), so seed it here.
+        const int masterIdx = masterZoneIndex();
+        if (masterIdx >= 0 && !(stateMessage2.setpoint >= 16) &&
+            zoneSetpoint[masterIdx] >= 16 && zoneSetpoint[masterIdx] <= 30) {
+            stateMessage2.setpoint = zoneSetpoint[masterIdx];
+        }
     }
 
     // Pack one zone's setpoint and observed temperature into the wire format
