@@ -22,6 +22,8 @@ class Controller {
     double _autoLow = 21.0, _autoHigh = 23.0;
     /// Wall-controller zone (1-8) whose setpoint is the master setpoint; 0 = unset.
     uint8_t _masterZone = 0;
+    /// Responder mode collapses Off* to Off, so remember the mode to resume on power-on.
+    OperatingMode _resumeMode = OperatingMode::FanOnly;
     /// Que zones may be set within this many °C of the master in Heat/Cool.
     static constexpr double ZONE_WINDOW = 2.0;
     int masterZoneIndex() const;

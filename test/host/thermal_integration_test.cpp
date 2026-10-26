@@ -131,5 +131,27 @@ int main() {
  e.zoneSetpoint[7]=23;
  e.setSlaveResponderMode(3,true);
  assert(e.getMasterSetpoint()==23);
+ // Power-on resumes the last active mode, and rooms drive system power.
+ static NullBus bus4;
+ static Controller f(bus4, 0);
+ f.setSlaveResponderMode(3,true);
+ f.setMasterZone(8);
+ f.setOperatingMode(OperatingMode::Cool);
+ assert(f.getSystemOn());
+ f.setSystemOn(false);
+ assert(!f.getSystemOn());
+ f.setSystemOn(true);
+ assert(f.getOperatingMode()==OperatingMode::Cool);
+ f.setSystemOn(false);
+ f.setZoneOn(1,true);                       // a room on starts the system...
+ assert(f.getOperatingMode()==OperatingMode::Cool);
+ assert(f.getZoneOn(1) && !f.getZoneOn(8)); // ...with just that room
+ f.setZoneOn(2,true);
+ f.setZoneOn(1,false);
+ assert(f.getSystemOn());                   // another room still on
+ f.setZoneOn(2,false);
+ assert(!f.getSystemOn());                  // last room off stops it
+ f.setZoneOn(3,true);
+ assert(f.getOperatingMode()==OperatingMode::Cool && f.getZoneOn(3));
  std::puts("Thermal controller integration tests passed");
 }

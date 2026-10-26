@@ -1608,6 +1608,13 @@ namespace Actron485 {
             }
         }
 
+        // Responder mode stores plain Off, which would always resume as Fan
+        // only. Resume the last active mode instead.
+        if (_slaveResponderEnabled && _slaveResponderId == 3) {
+            if (on && currentMode == OperatingMode::Off) nextMode = _resumeMode;
+            if (!on && nextMode != currentMode) _resumeMode = currentMode;
+        }
+
         if (nextMode == currentMode) {
             return;
         }
@@ -1972,6 +1979,15 @@ namespace Actron485 {
         if (_slaveResponderEnabled && _slaveResponderId == 3) {
             stateMessage2.initialised = true;
             stateMessage2.zoneOn[zindex(zone)] = on;
+
+            // Rooms drive the system: turning one on starts it (with just the
+            // rooms switched on), and turning the last one off stops it.
+            bool anyOn = false;
+            for (int z = 0; z < 8; z++) anyOn = anyOn || stateMessage2.zoneOn[z];
+            const bool systemOn = getSystemOn();
+            if (on && !systemOn) { setSystemOn(true); return; }
+            if (!anyOn && systemOn) { setSystemOn(false); return; }
+
             tickThermostat();
             renderSlave3State();
         }
