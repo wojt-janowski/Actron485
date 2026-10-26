@@ -1644,6 +1644,20 @@ void Actron485ApiHandler::add_cors_headers_(AsyncWebServerResponse *response) {
   // DefaultHeaders. We add the method/header list for preflight support.
   response->addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   response->addHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  // See close_after_response().
+  response->addHeader("Connection", "close");
+}
+
+// The IDF httpd allows 7 open sockets and ESPHome enables LRU purge, so the
+// 8th connection silently closes the oldest. Clients that keep API
+// connections alive (Home Assistant's rest_command pools them) then send
+// their next POST on a purged socket and get "Connection reset by peer",
+// and POSTs are not retried. A burst of zone-sensor updates easily exceeds
+// 7 sockets. Closing each API session once its response is sent keeps the
+// pool free; the close is queued and runs after the handler returns.
+static void close_after_response(AsyncWebServerRequest *request) {
+  httpd_req_t *r = *request;
+  httpd_sess_trigger_close(r->handle, httpd_req_to_sockfd(r));
 }
 
 // ESPHome's web_server_idf::AsyncWebServerRequest::init_response_ only
@@ -1670,6 +1684,7 @@ void Actron485ApiHandler::send_json_(AsyncWebServerRequest *request, int code, c
   add_cors_headers_(response);
   override_status(request, code);
   request->send(response);
+  close_after_response(request);
 }
 
 void Actron485ApiHandler::send_error_(AsyncWebServerRequest *request, int code, const char *message) {
@@ -1685,6 +1700,7 @@ void Actron485ApiHandler::handleRequest(AsyncWebServerRequest *request) {
     add_cors_headers_(response);
     override_status(request, 204);
     request->send(response);
+    close_after_response(request);
     return;
   }
 
