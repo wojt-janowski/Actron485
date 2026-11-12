@@ -87,12 +87,7 @@ void Actron485Climate::setup() {
                        "on Modbus slave 3. Wall LCD data leads MUST be "
                        "disconnected from J6 DATA bus to avoid frame "
                        "collisions.");
-        // Restore last-known-good state from NVS BEFORE setSlaveResponderMode
-        // primes the buffer, so initSlave3Defaults' fallback values don't
-        // briefly clobber the restored state. initSlave3Defaults is
-        // load-aware: it only fills in zero / uninitialised fields.
-        load_slave3_state_();
-        actron_controller.setSlaveResponderMode(3, true);
+        set_slave3_responder(true);
     }
     logStream_ = LogStream();
     if (logging_mode_ > 0) {
@@ -131,7 +126,7 @@ void Actron485Climate::loop() {
                 if (auto_range_pref_.save(&current)) saved_auto_range_=current;
             }
         }
-        if (act_as_slave_3_) {
+        if (actron_controller.getSlaveResponderEnabled()) {
             maybe_save_slave3_state_();
         }
     }
@@ -297,13 +292,29 @@ void Actron485Climate::dump_config() {
   this->dump_traits_(TAG);
 }
 
-void Actron485Climate::load_slave3_state_() {
+void Actron485Climate::set_slave3_responder(bool on) {
+    // Restore last-known-good state from NVS BEFORE setSlaveResponderMode
+    // primes the buffer, so initSlave3Defaults' fallback values don't
+    // briefly clobber the restored state. initSlave3Defaults is
+    // load-aware: it only fills in zero / uninitialised fields.
+    // Switching on at runtime after passive bus reads keeps that live state
+    // instead of overwriting it with an older saved one.
+    if (on && !slave3_persist_ready_) {
+        load_slave3_state_(!actron_controller.stateMessage2.initialised);
+    }
+    actron_controller.setSlaveResponderMode(3, on);
+}
+
+void Actron485Climate::load_slave3_state_(bool restore) {
     // Stable hash for the preference slot. Bumping this key (or the layout
     // version inside the blob) invalidates any previously-saved state on
     // upgrade — desired when the persisted schema changes.
     uint32_t hash = fnv1_hash(std::string("actron485_slave3_state_v1"));
     slave3_state_pref_ = global_preferences->make_preference<Slave3PersistedState>(hash);
     slave3_persist_ready_ = true;
+    if (!restore) {
+        return;
+    }
 
     Slave3PersistedState blob{};
     if (!slave3_state_pref_.load(&blob)) {

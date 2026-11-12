@@ -91,6 +91,10 @@ class Actron485Climate : public climate::Climate, public Component {
         // Actron485::Controller::setSlaveResponderMode for the hardware
         // precondition (disconnect wall LCD data leads first).
         void set_act_as_slave_3(bool enabled) { act_as_slave_3_ = enabled; }
+        // Turns slave-3 responder mode on or off. Turning it on restores the
+        // saved AC state first (once per boot), whether the mode comes from
+        // YAML or from the API's stored settings.
+        void set_slave3_responder(bool on);
 
         void add_zone(int number, Actron485ZoneFan *fan);
         void add_ultima_zone(int number, Actron485ZoneClimate *climate);
@@ -169,7 +173,8 @@ class Actron485Climate : public climate::Climate, public Component {
         // setSlaveResponderMode primes the buffer. Safe to call when no
         // saved state exists — just leaves the controller's in-class defaults
         // for initSlave3Defaults to fill in.
-        void load_slave3_state_();
+        // restore=false only prepares the slot for saving.
+        void load_slave3_state_(bool restore);
         // Snapshot the live state and persist if it diverges from the last
         // saved snapshot. Throttled internally to once every ~5 s so a flurry
         // of API writes doesn't burn flash wear.

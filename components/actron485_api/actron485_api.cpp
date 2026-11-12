@@ -917,10 +917,7 @@ void Actron485Api::load_settings_() {
   // which the climate component only attaches at its own setup(), so applying
   // it here could race the sink (re)attachment.
   if (climate_) {
-    auto *c = climate_->get_controller();
-    if (c) {
-      c->setSlaveResponderMode(3, settings_act_as_slave_3_);
-    }
+    climate_->set_slave3_responder(settings_act_as_slave_3_);
   }
   ESP_LOGCONFIG(TAG, "  Loaded settings: act_as_slave_3=%s log_mode=%d api_key=%s",
                 settings_act_as_slave_3_ ? "on" : "off", settings_logging_mode_,
@@ -1036,8 +1033,8 @@ void Actron485Api::set_api_key_runtime(const std::string &key) {
 
 void Actron485Api::set_act_as_slave_3_runtime(bool on) {
   settings_act_as_slave_3_ = on;
-  if (climate_ && climate_->get_controller()) {
-    climate_->get_controller()->setSlaveResponderMode(3, on);
+  if (climate_) {
+    climate_->set_slave3_responder(on);
   }
   this->save_settings_();
   ESP_LOGW(TAG, "act_as_slave_3 runtime-toggled %s — wall LCD data leads MUST be "
