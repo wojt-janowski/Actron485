@@ -1758,13 +1758,14 @@ namespace Actron485 {
             return;
         }
 
-        FanMode fanSpeed = getFanSpeed();
-        FanMode resolved = fanSpeed;
-        switch (fanSpeed) {
-            case FanMode::Low:    resolved = on ? FanMode::LowContinuous    : fanSpeed; break;
-            case FanMode::Medium: resolved = on ? FanMode::MediumContinuous : fanSpeed; break;
-            case FanMode::High:   resolved = on ? FanMode::HighContinuous   : fanSpeed; break;
-            case FanMode::Esp:    resolved = on ? FanMode::EspContinuous    : fanSpeed; break;
+        // The stored speed is already a *Continuous variant while continuous
+        // is on, so match both forms or turning it off is silently dropped.
+        FanMode resolved;
+        switch (getFanSpeed()) {
+            case FanMode::Low:    case FanMode::LowContinuous:    resolved = on ? FanMode::LowContinuous    : FanMode::Low;    break;
+            case FanMode::Medium: case FanMode::MediumContinuous: resolved = on ? FanMode::MediumContinuous : FanMode::Medium; break;
+            case FanMode::High:   case FanMode::HighContinuous:   resolved = on ? FanMode::HighContinuous   : FanMode::High;   break;
+            case FanMode::Esp:    case FanMode::EspContinuous:    resolved = on ? FanMode::EspContinuous    : FanMode::Esp;    break;
             default: return;
         }
         nextFanModeCommand.fanMode = resolved;

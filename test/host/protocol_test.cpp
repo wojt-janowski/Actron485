@@ -45,6 +45,16 @@ int main() {
         check(c.getSlaveRegister(3) == captured[i], "fan command matches original controller capture");
         check(c.getSlaveRegister(4) == 0x4000, "fan-only zone 7 bitmap has zero low byte");
     }
+    // Continuous fan sets reg 3 hi bit 2 (capture: 0x09 -> 0x0D) and must clear again,
+    // including after a speed change while continuous.
+    c.setFanSpeed(FanMode::Low);
+    c.setContinuousFanMode(true);
+    check(c.getContinuousFanMode() && c.getSlaveRegister(3) == 0x0d28, "continuous fan sets flag");
+    c.setFanSpeed(FanMode::Medium);
+    check(c.getContinuousFanMode() && c.getSlaveRegister(3) == 0x153d, "speed change keeps continuous");
+    c.setContinuousFanMode(false);
+    check(!c.getContinuousFanMode() && c.getSlaveRegister(3) == 0x113d, "continuous fan turns off");
+    check(c.getFanSpeed() == FanMode::Medium, "turning continuous off keeps the speed");
     c.setOperatingMode(OperatingMode::Heat);
     check(c.getSlaveRegister(4) == 0x4023, "thermal zone encoding retained");
     c.setSystemOn(false);
