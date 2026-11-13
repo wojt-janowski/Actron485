@@ -12,9 +12,11 @@ int main() {
  t.reset(0);
  auto z=one(22);
  assert(t.step(179999,Mode::Heat,z).demand==0);
+ assert(t.restartRemainingMs(179999)==1 && t.starts()==0);
  assert(t.step(181000,Mode::Heat,z).branch==Mode::Heat);
  for(uint32_t n=182000;n<=210000;n+=1000) t.step(n,Mode::Heat,z);
  assert(t.output().demand==100);
+ assert(t.starts()==1 && t.runningMs(210000)==29000 && t.restartRemainingMs(210000)==0);
  z[6].temperature=26;
  assert(t.step(211000,Mode::Heat,z).demand==0);
  z[6].temperature=25.6;

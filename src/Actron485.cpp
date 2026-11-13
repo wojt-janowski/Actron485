@@ -379,6 +379,13 @@ namespace Actron485 {
                            || printOutMode == PrintOutMode::CorrelationCapture)) {
                 printModbusMessage();
             }
+        } else if (_serialBuffer[0] == 0x01 && printOut) {
+            // Outdoor-unit diagnostic: show slave 1 frames that fail framing or CRC.
+            printOut->print("[s1-dropped] ");
+            printOut->print(_serialBufferIndex);
+            printOut->print(" bytes:");
+            printBytes(_serialBuffer, _serialBufferIndex);
+            printOut->println();
         }
 
         _serialBufferIndex = 0;
@@ -472,6 +479,7 @@ namespace Actron485 {
                     transmitSlaveReadResponse(startAddr, regCount);
                     return;
                 }
+                if (slave == 1) _outdoorUnitRequests++;
                 _modbusLastReadSlave = slave;
                 _modbusLastReadFunction = function;
                 _modbusLastReadStartAddress = (uint16_t(frame[2]) << 8) | frame[3];
@@ -517,6 +525,7 @@ namespace Actron485 {
             }
 
             if (slave == 1) {
+                _outdoorUnitReplies++;
                 applySlave1ReadResponse(startAddr, regCount, data);
             } else if (slave == 3) {
                 applySlave3ReadResponse(startAddr, regCount, data);
@@ -1017,7 +1026,10 @@ namespace Actron485 {
             // Actron message type. Several Actron types (notably IndoorBoard1 = 0x01) collide with
             // valid Modbus slave addresses, and their second byte can match a Modbus function code,
             // which would otherwise cause Modbus framing to chop the Actron frame in half.
-            if (firstByteType == MessageType::Unknown) {
+            // IndoorBoard1 has no known length, so Modbus framing is the only length
+            // there is: without it, Que slave 1 (outdoor unit) replies, which start
+            // with 0x01, fall back to the 5 ms break and split across loop() passes.
+            if (firstByteType == MessageType::Unknown || firstByteType == MessageType::IndoorBoard1) {
                 uint8_t modbusLength = expectedModbusMessageLength();
                 if (modbusLength > 0 && (_serialBufferExpectedLength == 0 || modbusLength > _serialBufferExpectedLength)) {
                     _serialBufferExpectedLength = modbusLength;

@@ -154,6 +154,18 @@ Controller::RegisterCacheLookup Controller::updateRegisterCache(uint8_t slave, u
     return result;
 }
 
+bool Controller::getRecentRegister(uint8_t slave, uint16_t address, unsigned long maxAgeMs, uint16_t &value) {
+    for (size_t i = 0; i < _registerCacheCount; i++) {
+        const auto &slot = _registerCache[i];
+        if (slot.slave == slave && slot.address == address) {
+            if (platformMillis() - slot.lastSeenMs > maxAgeMs) return false;
+            value = slot.value;
+            return true;
+        }
+    }
+    return false;
+}
+
 void Controller::printRegisterDelta(uint8_t slave, uint16_t address, uint16_t value) {
     // Always update the cache (so /api/v1/bus has live state regardless of
     // logging mode). Only emit the human-readable delta line when actually

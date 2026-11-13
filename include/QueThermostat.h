@@ -3,6 +3,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <string_view>
 #include "Actron485Models.h"
 
 namespace Actron485 {
@@ -32,6 +33,15 @@ class QueThermostat {
     initialized_ = true;
   }
   const Output &output() const { return output_; }
+  // Diagnostics: time left in the restart delay, length of the current call,
+  // and how many calls have started since boot.
+  uint32_t restartRemainingMs(uint32_t now) const {
+    if (output_.branch != OperatingMode::Off || std::string_view(output_.reason) != "restart_delay") return 0;
+    const uint32_t off = now - stopped_at_;
+    return off < MIN_OFF_MS ? MIN_OFF_MS - off : 0;
+  }
+  uint32_t runningMs(uint32_t now) const { return output_.branch == OperatingMode::Off ? 0 : now - started_at_; }
+  uint32_t starts() const { return starts_; }
 
   Output step(uint32_t now, OperatingMode selected, const std::array<Zone,8> &zones) {
     if (!initialized_) reset(now);
@@ -76,6 +86,7 @@ class QueThermostat {
     const double target = std::clamp(error*25.0,20.0,cap);
     // Slew upward by at most 5 units/s. Downward corrections are immediate.
     const double next = std::min(target, demand_+std::min<uint32_t>(dt,1000)*0.005);
+    if (output_.branch == OperatingMode::Off) { started_at_=now; ++starts_; }
     output_.branch=desired;
     demand_=next;
     output_.demand=uint8_t(next);
@@ -91,7 +102,7 @@ class QueThermostat {
   }
   Output output_{};
   double demand_{0};
-  uint32_t stopped_at_{0},last_step_{0};
+  uint32_t stopped_at_{0},last_step_{0},started_at_{0},starts_{0};
   bool initialized_{false};
 };
 }

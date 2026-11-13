@@ -18,13 +18,17 @@ int failures = 0;
 void check(bool ok, const char *description) {
     if (!ok) { std::fprintf(stderr, "FAIL: %s\n", description); ++failures; }
 }
-void feed(Controller &c, Bus &bus, std::vector<uint8_t> frame) {
+std::vector<uint8_t> withCrc(std::vector<uint8_t> frame) {
     uint16_t crc = 0xffff;
     for (auto b : frame) {
         crc ^= b;
         for (int i = 0; i < 8; ++i) crc = (crc >> 1) ^ ((crc & 1) ? 0xa001 : 0);
     }
     frame.push_back(crc & 255); frame.push_back(crc >> 8);
+    return frame;
+}
+void feed(Controller &c, Bus &bus, std::vector<uint8_t> frame) {
+    frame = withCrc(frame);
     bus.incoming.insert(bus.incoming.end(), frame.begin(), frame.end());
     c.loop(); test_time_us += 40000; c.loop();
 }
@@ -90,6 +94,22 @@ int main() {
         check(c.stateMessage2.compressorMode == v.activity, "decode demand from reg 2 low byte");
         check(c.stateMessage2.fanActive == ((v.fan & 0x3a00) != 0), "all observed fan flags recognised");
     }
+    // Slave 1 (outdoor unit) replies start with 0x01, the legacy IndoorBoard1
+    // type byte. A 41-byte reply takes ~85 ms at 4800 baud, so it reaches the
+    // parser over several loop() passes that are each more than the 5 ms break
+    // apart. It must still be framed as one Modbus response.
+    feed(c, bus, {1,3,0,120,0,18});
+    std::vector<uint8_t> reply{1,3,36};
+    for (int i = 0; i < 18; ++i) { reply.push_back(0); reply.push_back(0); }
+    reply[3 + 10*2] = 0x41; reply[3 + 10*2 + 1] = 0xc4;  // reg 130/131 = 24.5f
+    reply = withCrc(reply);
+    for (size_t at = 0; at < reply.size(); at += 16) {
+        bus.incoming.insert(bus.incoming.end(), reply.begin() + at, reply.begin() + std::min(at + 16, reply.size()));
+        c.loop(); test_time_us += 16000;
+    }
+    c.loop(); test_time_us += 40000; c.loop();
+    check(c.getOutdoorTemperature() == 24.5, "outdoor-unit reply split across loop passes is decoded");
+    check(c.getOutdoorUnitRequests() == 1 && c.getOutdoorUnitReplies() == 1, "outdoor-unit requests and replies counted");
     check(bus.outgoing.empty(), "passive capture never transmits");
     if (failures) return EXIT_FAILURE;
     std::puts("All captured protocol regression tests passed");

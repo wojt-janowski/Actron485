@@ -59,6 +59,8 @@ class Controller {
     uint16_t _modbusLastReadStartAddress = 0;
     uint16_t _modbusLastReadCount = 0;
     unsigned long _modbusLastReadTimestamp = 0;
+    uint32_t _outdoorUnitRequests = 0;
+    uint32_t _outdoorUnitReplies = 0;
 
     /// @brief Slave-responder mode. When `_slaveResponderEnabled` is true and
     /// an inbound Modbus request is addressed to `_slaveResponderId`, the
@@ -419,6 +421,13 @@ public:
     double getAutoTargetLow() const { return _autoLow; }
     double getAutoTargetHigh() const { return _autoHigh; }
     const QueThermostat::Output &getThermalOutput() const { return _thermostat.output(); }
+    const QueThermostat &getThermostat() const { return _thermostat; }
+
+    /// @brief Last value seen on the bus for (slave, address), if seen within maxAgeMs.
+    bool getRecentRegister(uint8_t slave, uint16_t address, unsigned long maxAgeMs, uint16_t &value);
+    /// @brief Slave 1 (outdoor unit) read requests seen and replies decoded since boot.
+    uint32_t getOutdoorUnitRequests() const { return _outdoorUnitRequests; }
+    uint32_t getOutdoorUnitReplies() const { return _outdoorUnitReplies; }
     bool isZoneSensorFresh(uint8_t zone) const;
 
     // System Control
