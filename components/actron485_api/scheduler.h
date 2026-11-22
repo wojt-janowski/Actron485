@@ -32,7 +32,7 @@ namespace actron485_api {
 
 class Actron485Api;  // fwd — parent component, owns the command path + inputs
 
-static constexpr int SCHED_MAX = 16;        // NVS blob cap (~2.4 KB total)
+static constexpr int SCHED_MAX = 32;        // NVS blob cap (~5 KB total)
 static constexpr int SCHED_MAX_CONDITIONS = 4;
 static constexpr size_t SCHED_NAME_MAX = 31;
 
@@ -150,6 +150,9 @@ class Scheduler {
   std::string status_json();                                // GET /schedules/status
   std::string away_json();                                  // GET /away
   bool set_away_from_json(const std::string &body, std::string &err);  // POST /away
+  // Away without a return time, for the ESPHome "Schedules paused" switch.
+  bool away_active() const { return blob_.away_active != 0; }
+  void set_away(bool active);
 
  protected:
   Actron485Api *parent_;

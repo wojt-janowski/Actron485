@@ -19,7 +19,7 @@ static const char *const TAG = "actron485.sched";
 
 // Bumped only if the on-flash layout changes incompatibly.
 static constexpr uint32_t kSchedMagic = 0xAC773CED;
-static constexpr uint32_t kSchedVersion = 1;
+static constexpr uint32_t kSchedVersion = 2;  // 2: SCHED_MAX 16 -> 32
 // Re-evaluate at most this often. Calendar rules use a catch-up window so the
 // coarse tick never drops an occurrence; weather-gated rules just re-test.
 static constexpr uint32_t kEvalIntervalMs = 30000;
@@ -802,6 +802,13 @@ std::string Scheduler::status_json() {
   std::string out;
   serializeJson(doc, out);
   return out;
+}
+
+void Scheduler::set_away(bool active) {
+  blob_.away_active = active ? 1 : 0;
+  blob_.away_return_at = 0;
+  if (!active) { active_id_ = 0; overridden_ = false; }
+  save_();
 }
 
 std::string Scheduler::away_json() {
