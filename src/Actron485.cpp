@@ -1503,15 +1503,19 @@ namespace Actron485 {
         for (int z = 0; z < 8; z++) {
             if (stateMessage2.zoneOn[z]) { anyZoneOn = true; break; }
         }
+        // Sensor fallback: while an open zone has no reading, keep the
+        // indoor fan running so that zone still gets some airflow.
+        const bool sensorFallback = anyZoneOn && thermal.stale_zones != 0 &&
+            (mode == OperatingMode::Heat || mode == OperatingMode::Cool || mode == OperatingMode::Auto);
         if (anyZoneOn)                  reg3Hi |= 0x01;  // system armed
-        if (stateMessage2.continuousFan) reg3Hi |= 0x04;  // continuous fan
+        if (stateMessage2.continuousFan || sensorFallback) reg3Hi |= 0x04;  // continuous fan
         uint8_t reg3Lo;
         FanMode outputFan = stateMessage2.fanMode;
         if (mode != OperatingMode::FanOnly &&
             (outputFan == FanMode::Esp || outputFan == FanMode::EspContinuous)) {
             outputFan = thermal.demand >= 60 ? FanMode::High :
                 thermal.demand >= 35 ? FanMode::Medium :
-                thermal.demand > 0 ? FanMode::Low : FanMode::Esp;
+                thermal.demand > 0 || sensorFallback ? FanMode::Low : FanMode::Esp;
         }
         switch (outputFan) {
             case FanMode::Low:

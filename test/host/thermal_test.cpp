@@ -50,8 +50,16 @@ int main() {
  assert(t.step(180000,Mode::Auto,z).branch==Mode::Heat);
  z[0].temperature=35;
  assert(t.step(181000,Mode::Auto,z).branch==Mode::Heat);
+ // A zone that loses its sensor no longer blocks the others: it is flagged
+ // and control follows the zones that still report.
  z[0].fresh=false;
- assert(t.step(182000,Mode::Auto,z).demand==0);
+ assert(t.step(182000,Mode::Auto,z).branch==Mode::Heat);
+ assert(t.output().demand>0 && t.output().stale_zones==0x01);
+ // With no zone reporting there is nothing to control from.
+ z[6].temperature=NAN;
+ assert(t.step(183000,Mode::Auto,z).demand==0);
+ assert(std::string_view(t.output().reason)=="sensor_or_target_invalid" && t.output().stale_zones==0x41);
+ z[6].temperature=22; z[0].fresh=true;
  z[0].enabled=false;
  assert(t.step(400000,Mode::Auto,z).branch==Mode::Heat);
  // No valid reading, invalid bounds and no enabled zones cannot call.

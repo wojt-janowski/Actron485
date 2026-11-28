@@ -153,5 +153,26 @@ int main() {
  assert(!f.getSystemOn());                  // last room off stops it
  f.setZoneOn(3,true);
  assert(f.getOperatingMode()==OperatingMode::Cool && f.getZoneOn(3));
+ // Sensor fallback: an open zone without a reading neither blocks the zone
+ // that reports nor goes without air; the fan keeps running on Low.
+ static NullBus bus5;
+ static Controller g(bus5, 0);
+ g.setSlaveResponderMode(3,true);
+ g.setOperatingMode(OperatingMode::Cool);
+ g.setFanSpeed(FanMode::Esp);
+ for (auto &on : g.stateMessage2.zoneOn) on=false;
+ g.stateMessage2.zoneOn[5]=true;
+ g.setZoneSetpointTemperatureCustom(6,22,false);
+ for(int i=0;i<10;++i) { test_time_us+=1000000; g.loop(); }
+ assert((g.getSlaveRegister(2)&255)==0);                     // nothing to control from
+ assert(g.getSlaveRegister(3)==((0x01|0x04|0x08)<<8|0x28));    // but the fan runs, Low
+ g.stateMessage2.zoneOn[6]=true;
+ g.setZoneSetpointTemperatureCustom(7,22,false);
+ for(int i=0;i<240;++i) { test_time_us+=1000000; g.setZoneCurrentTemperature(7,26); g.loop(); }
+ assert((g.getSlaveRegister(2)>>8)==2 && (g.getSlaveRegister(2)&255)>0);
+ assert(g.getThermalOutput().stale_zones==0x20 && (g.getSlaveRegister(3)>>8)&0x04);
+ g.stateMessage2.zoneOn[5]=false;                            // back to normal
+ for(int i=0;i<2;++i) { test_time_us+=1000000; g.setZoneCurrentTemperature(7,26); g.loop(); }
+ assert(g.getThermalOutput().stale_zones==0 && !((g.getSlaveRegister(3)>>8)&0x04));
  std::puts("Thermal controller integration tests passed");
 }

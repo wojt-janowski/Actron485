@@ -22,6 +22,10 @@ class QueThermostat {
     OperatingMode branch{OperatingMode::Off};
     uint8_t demand{0};
     const char *reason{"off"};
+    // Enabled zones without a usable reading (bit N-1 = zone N). Those zones
+    // ride along on the others' calls; the bridge keeps the fan running so
+    // they still get some airflow.
+    uint8_t stale_zones{0};
   };
   static constexpr uint32_t MIN_OFF_MS = 180000;
   static constexpr double START_ERROR = 0.5;
@@ -46,23 +50,34 @@ class QueThermostat {
   Output step(uint32_t now, OperatingMode selected, const std::array<Zone,8> &zones) {
     if (!initialized_) reset(now);
     const uint32_t dt = now - last_step_;
+    stale_ = 0;
     last_step_ = now;
     if (selected != OperatingMode::Heat && selected != OperatingMode::Cool &&
         selected != OperatingMode::Auto) return stop(now, "off");
     double heat = -1000, cool = -1000;
-    bool enabled = false;
-    for (const auto &z : zones) {
+    bool enabled = false, usable = false;
+    uint8_t stale = 0;
+    for (size_t i = 0; i < zones.size(); ++i) {
+      const auto &z = zones[i];
       if (!z.enabled) continue;
       enabled = true;
-      if (!z.fresh || !std::isfinite(z.temperature) || z.temperature < 0 ||
-          z.temperature > 60 || !std::isfinite(z.heat_target) ||
-          !std::isfinite(z.cool_target) || z.heat_target < 16 ||
-          z.cool_target > 30 || z.heat_target > z.cool_target)
+      if (!std::isfinite(z.heat_target) || !std::isfinite(z.cool_target) ||
+          z.heat_target < 16 || z.cool_target > 30 || z.heat_target > z.cool_target)
         return stop(now, "sensor_or_target_invalid");
+      // A missing or stale reading no longer blocks the other zones: control
+      // follows the zones that still report, and this one is flagged.
+      if (!z.fresh || !std::isfinite(z.temperature) || z.temperature < 0 ||
+          z.temperature > 60) {
+        stale |= uint8_t(1u << i);
+        continue;
+      }
+      usable = true;
       heat = std::max(heat, z.heat_target-z.temperature);
       cool = std::max(cool, z.temperature-z.cool_target);
     }
+    stale_ = stale;
     if (!enabled) return stop(now, "no_enabled_zones");
+    if (!usable) return stop(now, "sensor_or_target_invalid");
     OperatingMode desired = OperatingMode::Off;
     // Retain an active Auto branch until its enabled zones satisfy it.
     if (selected == OperatingMode::Heat || selected == OperatingMode::Cool) {
@@ -77,6 +92,7 @@ class QueThermostat {
       return stop(now, "changeover_delay");
     if (output_.branch == OperatingMode::Off && uint32_t(now-stopped_at_) < MIN_OFF_MS) {
       output_.reason="restart_delay";
+      output_.stale_zones=stale_;
       return output_;
     }
     const double error = desired == OperatingMode::Heat ? heat : cool;
@@ -91,17 +107,19 @@ class QueThermostat {
     demand_=next;
     output_.demand=uint8_t(next);
     output_.reason="calling";
+    output_.stale_zones=stale_;
     return output_;
   }
  private:
   Output stop(uint32_t now, const char *reason) {
     if (output_.branch != OperatingMode::Off) stopped_at_=now;
     demand_=0;
-    output_={OperatingMode::Off,0,reason};
+    output_={OperatingMode::Off,0,reason,stale_};
     return output_;
   }
   Output output_{};
   double demand_{0};
+  uint8_t stale_{0};
   uint32_t stopped_at_{0},last_step_{0},started_at_{0},starts_{0};
   bool initialized_{false};
 };
